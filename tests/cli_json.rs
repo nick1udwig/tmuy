@@ -164,7 +164,7 @@ fn json_outputs_cover_send_wait_kill_and_signal() -> Result<()> {
         .context("missing echoer id_hash")?
         .to_string();
 
-    let sent = run_tmuy(home.path(), &["--json", "send", &echoer_hash, "quit\n"])?;
+    let sent = run_tmuy(home.path(), &["--json", "send", &echoer_hash, "quit"])?;
     assert_success(&sent);
     let sent_json: Value = serde_json::from_slice(&sent.stdout)?;
     assert_eq!(sent_json["ok"], true);

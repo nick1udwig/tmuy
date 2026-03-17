@@ -33,7 +33,7 @@ fn subcommand_help_includes_user_facing_descriptions() -> Result<()> {
         (&["ls", "--help"], "List live sessions"),
         (&["tail", "--help"], "Print or follow terminal output"),
         (&["inspect", "--help"], "Show full metadata"),
-        (&["send", "--help"], "Send input bytes"),
+        (&["send", "--help"], "pressing Enter by default"),
         (&["rename", "--help"], "Rename a live session"),
         (&["wait", "--help"], "Wait for a session to exit"),
         (&["signal", "--help"], "Send a specific POSIX signal"),
@@ -129,11 +129,11 @@ fn rename_send_from_stdin_and_wait_print_human_outputs() -> Result<()> {
     assert_success(&renamed);
     assert!(String::from_utf8_lossy(&renamed.stdout).contains("renamed alpha -> beta"));
 
-    let sent = run_tmuy_with_stdin(home.path(), &["send", "beta"], b"hello\n")?;
+    let sent = run_tmuy_with_stdin(home.path(), &["send", "beta"], b"hello")?;
     assert_success(&sent);
     assert_eq!(String::from_utf8_lossy(&sent.stdout), "sent\n");
 
-    let quit = run_tmuy(home.path(), &["send", "beta", "quit\n"])?;
+    let quit = run_tmuy(home.path(), &["send", "beta", "quit"])?;
     assert_success(&quit);
     let waited = run_tmuy(home.path(), &["wait", "beta", "--timeout-secs", "5"])?;
     assert_success(&waited);

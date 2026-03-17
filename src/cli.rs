@@ -46,7 +46,7 @@ enum Commands {
     Tail(TailArgs),
     /// Show full metadata for a session, including paths and sandbox settings.
     Inspect(NameArgs),
-    /// Send input bytes to a detached or attached live session.
+    /// Send input to a detached or attached live session, pressing Enter by default.
     Send(SendArgs),
     /// Rename a live session without changing its stable hash.
     Rename(RenameArgs),
@@ -136,6 +136,10 @@ struct SendArgs {
     /// Live session name or hash to write to.
     name: String,
 
+    /// Send the bytes exactly as provided without pressing Enter afterwards.
+    #[arg(long, action = ArgAction::SetTrue)]
+    no_enter: bool,
+
     /// Literal payload to send. If omitted, tmuy reads bytes from stdin.
     payload: Option<String>,
 }
@@ -220,7 +224,7 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         Commands::Send(args) => {
-            let bytes = match args.payload {
+            let mut bytes = match args.payload {
                 Some(payload) => payload.into_bytes(),
                 None => {
                     let mut buf = Vec::new();
@@ -228,6 +232,7 @@ pub fn run() -> Result<()> {
                     buf
                 }
             };
+            maybe_append_enter(&mut bytes, args.no_enter);
             runtime::send_input(&store, &args.name, &bytes)?;
             print_maybe_json(
                 cli.json,
@@ -343,6 +348,42 @@ fn ensure_attach_allowed() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn maybe_append_enter(bytes: &mut Vec<u8>, no_enter: bool) {
+    if no_enter {
+        return;
+    }
+    if matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        return;
+    }
+    bytes.push(b'\n');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::maybe_append_enter;
+
+    #[test]
+    fn maybe_append_enter_adds_newline_once() {
+        let mut bytes = b"echo hello".to_vec();
+        maybe_append_enter(&mut bytes, false);
+        assert_eq!(bytes, b"echo hello\n");
+
+        maybe_append_enter(&mut bytes, false);
+        assert_eq!(bytes, b"echo hello\n");
+    }
+
+    #[test]
+    fn maybe_append_enter_respects_no_enter_and_carriage_return() {
+        let mut bytes = b"raw".to_vec();
+        maybe_append_enter(&mut bytes, true);
+        assert_eq!(bytes, b"raw");
+
+        let mut bytes = b"line\r".to_vec();
+        maybe_append_enter(&mut bytes, false);
+        assert_eq!(bytes, b"line\r");
+    }
 }
 
 fn cmd_ls(store: &Store, json: bool, args: ListArgs) -> Result<()> {

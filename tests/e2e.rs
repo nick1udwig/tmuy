@@ -568,7 +568,7 @@ fn send_reaches_detached_session() -> Result<()> {
     )?;
     assert_success(&created);
 
-    let sent = run_tmuy(home.path(), &["send", "echoer", "hello\n"])?;
+    let sent = run_tmuy(home.path(), &["send", "echoer", "hello"])?;
     assert_success(&sent);
     std::thread::sleep(Duration::from_millis(300));
 
@@ -576,9 +576,48 @@ fn send_reaches_detached_session() -> Result<()> {
     assert_success(&tail);
     assert!(String::from_utf8_lossy(&tail.stdout).contains("E:hello"));
 
-    let quit = run_tmuy(home.path(), &["send", "echoer", "quit\n"])?;
+    let quit = run_tmuy(home.path(), &["send", "echoer", "quit"])?;
     assert_success(&quit);
     let waited = run_tmuy(home.path(), &["wait", "echoer", "--timeout-secs", "5"])?;
+    assert_success(&waited);
+    Ok(())
+}
+
+#[test]
+fn send_no_enter_leaves_command_pending_until_later_submit() -> Result<()> {
+    let home = TempDir::new()?;
+    let created = run_tmuy(
+        home.path(),
+        &[
+            "new",
+            "pending",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "while IFS= read -r line; do printf 'E:%s\\n' \"$line\"; [ \"$line\" = quit ] && exit 0; done",
+        ],
+    )?;
+    assert_success(&created);
+
+    let sent = run_tmuy(home.path(), &["send", "--no-enter", "pending", "hel"])?;
+    assert_success(&sent);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let tail = run_tmuy(home.path(), &["tail", "pending"])?;
+    assert_success(&tail);
+    assert!(!String::from_utf8_lossy(&tail.stdout).contains("E:hel"));
+
+    let sent = run_tmuy(home.path(), &["send", "pending", "lo"])?;
+    assert_success(&sent);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let tail = run_tmuy(home.path(), &["tail", "pending"])?;
+    assert_success(&tail);
+    assert!(String::from_utf8_lossy(&tail.stdout).contains("E:hello"));
+
+    let quit = run_tmuy(home.path(), &["send", "pending", "quit"])?;
+    assert_success(&quit);
+    let waited = run_tmuy(home.path(), &["wait", "pending", "--timeout-secs", "5"])?;
     assert_success(&waited);
     Ok(())
 }
@@ -600,12 +639,12 @@ fn tail_follow_streams_new_output() -> Result<()> {
     assert_success(&created);
 
     let mut tail = spawn_output_tmuy(home.path(), &["tail", "-f", "stream"])?;
-    let sent = run_tmuy(home.path(), &["send", "stream", "alpha\n"])?;
+    let sent = run_tmuy(home.path(), &["send", "stream", "alpha"])?;
     assert_success(&sent);
     let output = tail.read_until_contains("S:alpha", Duration::from_secs(5))?;
     assert!(output.contains("S:alpha"));
 
-    let quit = run_tmuy(home.path(), &["send", "stream", "quit\n"])?;
+    let quit = run_tmuy(home.path(), &["send", "stream", "quit"])?;
     assert_success(&quit);
     let status = tail.wait_for_exit(Duration::from_secs(5))?;
     assert!(status.success(), "tail -f exit status was {status:?}");
