@@ -42,6 +42,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes bubblewrap
 
+      - name: Smoke test release installer
+        run: bash tests/install-script.sh
+
       - name: Format check
         run: cargo fmt --check
 

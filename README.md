@@ -20,13 +20,25 @@ Sandboxing via [Bubblewrap](https://github.com/containers/bubblewrap) on Linux.
 ## Install
 
 ```bash
-cargo install --path .
+curl -fsSL https://raw.githubusercontent.com/nick1udwig/tmuy/master/install.sh | sh
 ```
 
 Or:
 
 ```bash
-cargo build --release
+curl -fsSL https://raw.githubusercontent.com/nick1udwig/tmuy/master/install.sh | sh -s -- -b ~/.local/bin
+```
+
+Pin a specific release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nick1udwig/tmuy/master/install.sh | sh -s -- -v v0.2.0
+```
+
+Build from source:
+
+```bash
+cargo install --path .
 ```
 
 ## Usage
