@@ -12,6 +12,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
+use crossterm::queue;
+use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
+use crossterm::terminal::{Clear, ClearType, size};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use nix::sys::signal::{Signal, kill as send_signal};
 use nix::unistd::{Pid, setsid};
@@ -256,14 +260,17 @@ pub fn attach(store: &Store, name: &str, detach_key: &str) -> Result<()> {
 
     enable_raw_mode()?;
     let _restore = RawModeGuard;
+    let status_bar = StatusBarGuard::enter(&session, detach_key)?;
     let mut stdout = io::stdout();
     let mut buf = [0u8; 4096];
+    status_bar.render(&mut stdout)?;
     loop {
         match read_stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
                 stdout.write_all(&buf[..n])?;
                 stdout.flush()?;
+                status_bar.render(&mut stdout)?;
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) if is_peer_closed(&err) => break,
@@ -576,10 +583,190 @@ fn is_peer_closed(err: &io::Error) -> bool {
     )
 }
 
+fn format_status_bar(session: &SessionRecord, detach_key: &str, width: u16) -> String {
+    let width = width as usize;
+    if width == 0 {
+        return String::new();
+    }
+
+    let content = format!(
+        " tmuy {} ({}) | detach {} | sandbox {} ",
+        session.current_name,
+        session.id_hash,
+        detach_key,
+        format_sandbox_summary(session)
+    );
+    fit_status_content(&content, width)
+}
+
+fn fit_status_content(content: &str, width: usize) -> String {
+    if content.len() >= width {
+        if width <= 3 {
+            return ".".repeat(width);
+        }
+        let mut shortened = content[..width - 3].to_string();
+        shortened.push_str("...");
+        return shortened;
+    }
+
+    let mut padded = content.to_string();
+    padded.push_str(&" ".repeat(width - content.len()));
+    padded
+}
+
+fn format_sandbox_summary(session: &SessionRecord) -> String {
+    let grants = session
+        .sandbox
+        .fs
+        .iter()
+        .map(|grant| match grant {
+            FsGrant::Full => "fs:full".to_string(),
+            FsGrant::ReadOnly(path) => format!("fs:ro:{}", path.display()),
+            FsGrant::ReadWrite(path) => format!("fs:rw:{}", path.display()),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let net = match session.sandbox.net {
+        crate::model::NetworkMode::On => "net:on",
+        crate::model::NetworkMode::Off => "net:off",
+    };
+    format!("{grants} {net}")
+}
+
+struct StatusBarGuard {
+    session: SessionRecord,
+    detach_key: String,
+    rows: Option<u16>,
+}
+
+impl StatusBarGuard {
+    fn enter(session: &SessionRecord, detach_key: &str) -> Result<Self> {
+        let (_, rows) = terminal_size();
+        let rows = rows.max(2);
+        let mut stdout = io::stdout();
+        write!(stdout, "\x1b[1;{}r", rows - 1)?;
+        stdout.flush()?;
+        Ok(Self {
+            session: session.clone(),
+            detach_key: detach_key.to_string(),
+            rows: Some(rows),
+        })
+    }
+
+    fn render(&self, stdout: &mut impl Write) -> Result<()> {
+        let Some(rows) = self.rows else {
+            return Ok(());
+        };
+        let (width, _) = terminal_size();
+        let line = format_status_bar(&self.session, &self.detach_key, width);
+        queue!(
+            stdout,
+            SavePosition,
+            MoveTo(0, rows - 1),
+            SetForegroundColor(Color::Black),
+            SetBackgroundColor(Color::White),
+            Clear(ClearType::CurrentLine),
+            Print(line),
+            ResetColor,
+            RestorePosition
+        )?;
+        stdout.flush()?;
+        Ok(())
+    }
+}
+
+impl Drop for StatusBarGuard {
+    fn drop(&mut self) {
+        if let Some(rows) = self.rows {
+            let mut stdout = io::stdout();
+            let _ = queue!(
+                stdout,
+                SavePosition,
+                MoveTo(0, rows - 1),
+                ResetColor,
+                Clear(ClearType::CurrentLine),
+                RestorePosition
+            );
+            let _ = write!(stdout, "\x1b[r");
+            let _ = stdout.flush();
+        }
+    }
+}
+
+fn terminal_size() -> (u16, u16) {
+    match size() {
+        Ok((cols, rows)) if cols >= 1 && rows >= 1 => (cols, rows),
+        _ => (80, 24),
+    }
+}
+
 struct RawModeGuard;
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use chrono::Utc;
+
+    use super::*;
+    use crate::model::{CommandMode, FsGrant, NetworkMode, SandboxSpec, SessionStatus};
+
+    fn sample_session() -> SessionRecord {
+        SessionRecord {
+            id_hash: "1a2b3c4".to_string(),
+            started_name: "demo".to_string(),
+            current_name: "demo".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            cwd: PathBuf::from("/tmp/demo"),
+            command: vec!["/bin/sh".to_string()],
+            mode: CommandMode::Shell,
+            sandbox: SandboxSpec {
+                fs: vec![
+                    FsGrant::ReadOnly(PathBuf::from("/tmp/demo")),
+                    FsGrant::ReadWrite(PathBuf::from("/tmp/out")),
+                ],
+                net: NetworkMode::Off,
+            },
+            status: SessionStatus::Live,
+            started_log_dir: PathBuf::from("/tmp/log"),
+            meta_path: PathBuf::from("/tmp/log/meta.json"),
+            log_path: PathBuf::from("/tmp/log/pty.log"),
+            events_path: PathBuf::from("/tmp/log/events.jsonl"),
+            socket_path: PathBuf::from("/tmp/live.sock"),
+            service_pid: Some(1),
+            child_pid: Some(2),
+            exit_code: None,
+            failure_reason: None,
+            env: BTreeMap::new(),
+            detach_key: "C-b d".to_string(),
+        }
+    }
+
+    #[test]
+    fn format_status_bar_includes_requested_fields() {
+        let session = sample_session();
+        let line = format_status_bar(&session, "C-b d", 200);
+        assert!(line.contains("demo"));
+        assert!(line.contains("1a2b3c4"));
+        assert!(line.contains("C-b d"));
+        assert!(line.contains("fs:ro:/tmp/demo"));
+        assert!(line.contains("fs:rw:/tmp/out"));
+        assert!(line.contains("net:off"));
+    }
+
+    #[test]
+    fn format_status_bar_truncates_to_width() {
+        let session = sample_session();
+        let line = format_status_bar(&session, "C-b d", 20);
+        assert_eq!(line.len(), 20);
+        assert!(line.ends_with("..."));
     }
 }

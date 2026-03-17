@@ -204,6 +204,37 @@ fn attach_replays_existing_output() -> Result<()> {
 }
 
 #[test]
+fn attach_shows_status_bar_immediately_for_quiet_sessions() -> Result<()> {
+    let home = TempDir::new()?;
+    let created = run_tmuy(
+        home.path(),
+        &["--json", "new", "quiet", "--", "/bin/sh", "-lc", "sleep 30"],
+    )?;
+    assert_success(&created);
+    let created_json: serde_json::Value = serde_json::from_slice(&created.stdout)?;
+    let hash = created_json["id_hash"]
+        .as_str()
+        .context("missing id_hash in new --json output")?
+        .to_string();
+
+    let mut attach = spawn_attach(home.path(), &["attach", "quiet"])?;
+    let output = attach.read_until_contains("tmuy quiet", Duration::from_secs(5))?;
+    assert!(output.contains(&hash));
+    assert!(output.contains("detach C-b d"));
+    assert!(output.contains("sandbox fs:full net:on"));
+
+    attach.write_all(&[0x02, b'd'])?;
+    let status = attach.wait_for_exit(Duration::from_secs(5))?;
+    assert!(status.success(), "attach exit status was {status:?}");
+
+    let interrupted = run_tmuy(home.path(), &["kill", "quiet"])?;
+    assert_success(&interrupted);
+    let waited = run_tmuy(home.path(), &["wait", "quiet", "--timeout-secs", "5"])?;
+    assert_success(&waited);
+    Ok(())
+}
+
+#[test]
 fn kill_sends_ctrl_c_style_interrupt() -> Result<()> {
     let home = TempDir::new()?;
     let created = run_tmuy(
