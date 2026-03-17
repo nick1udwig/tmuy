@@ -150,11 +150,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
           RELEASE_SHA: ${{ needs.prepare-release.outputs.sha }}
+          RELEASE_REPO: ${{ github.repository }}
         run: |
-          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release upload "${RELEASE_TAG}" dist/* --clobber
+          if gh release view "${RELEASE_TAG}" --repo "${RELEASE_REPO}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" dist/* --repo "${RELEASE_REPO}" --clobber
           else
             gh release create "${RELEASE_TAG}" dist/* \
+              --repo "${RELEASE_REPO}" \
               --target "${RELEASE_SHA}" \
               --title "${RELEASE_TAG}" \
               --notes "Automated release for ${RELEASE_TAG}"
