@@ -485,6 +485,15 @@ mod tests {
     }
 
     #[test]
+    fn create_session_writes_created_event() {
+        let (_tmp, store) = make_store();
+        let created = store.create_session(base_request(Some("alpha"))).unwrap();
+        let events = std::fs::read_to_string(created.events_path).unwrap();
+        assert!(events.contains("\"kind\":\"created\""));
+        assert!(events.contains("\"name\":\"alpha\""));
+    }
+
+    #[test]
     fn rename_keeps_hash_and_started_path() {
         let (_tmp, store) = make_store();
         let created = store.create_session(base_request(Some("alpha"))).unwrap();
@@ -493,6 +502,9 @@ mod tests {
         assert_eq!(created.started_name, renamed.started_name);
         assert_eq!(created.started_log_dir, renamed.started_log_dir);
         assert_eq!(renamed.current_name, "beta");
+        let events = std::fs::read_to_string(renamed.events_path).unwrap();
+        assert!(events.contains("\"kind\":\"renamed\""));
+        assert!(events.contains("\"current_name\":\"beta\""));
     }
 
     #[test]
@@ -605,8 +617,22 @@ mod tests {
         store.mark_exited(&first.id_hash, Some(0)).unwrap();
         let second = store.create_session(base_request(Some("same"))).unwrap();
         store.mark_exited(&second.id_hash, Some(0)).unwrap();
-        let err = store.resolve_by_name("same", SessionScope::All).unwrap_err();
+        let err = store
+            .resolve_by_name("same", SessionScope::All)
+            .unwrap_err();
         assert!(err.to_string().contains("ambiguous session name"));
+    }
+
+    #[test]
+    fn resolve_by_name_dead_only_returns_dead_session() {
+        let (_tmp, store) = make_store();
+        let created = store.create_session(base_request(Some("dead"))).unwrap();
+        store.mark_exited(&created.id_hash, Some(0)).unwrap();
+        let resolved = store
+            .resolve_by_name("dead", SessionScope::DeadOnly)
+            .unwrap();
+        assert_eq!(resolved.id_hash, created.id_hash);
+        assert_eq!(resolved.status, SessionStatus::Exited);
     }
 
     #[test]
@@ -616,6 +642,9 @@ mod tests {
         let failed = store.mark_failed(&created.id_hash, "boom").unwrap();
         assert_eq!(failed.status, SessionStatus::Failed);
         assert_eq!(failed.failure_reason.as_deref(), Some("boom"));
+        let events = std::fs::read_to_string(&failed.events_path).unwrap();
+        assert!(events.contains("\"kind\":\"failed\""));
+        assert!(events.contains("\"reason\":\"boom\""));
         let live = store.mark_live(&created.id_hash, 10, Some(11)).unwrap();
         assert_eq!(live.status, SessionStatus::Live);
         assert_eq!(live.failure_reason, None);
@@ -681,6 +710,14 @@ mod tests {
 
         let err = parse_sandbox(&["xx:src".to_string()], None, Path::new("/work")).unwrap_err();
         assert!(err.to_string().contains("invalid --fs mode"));
+
+        let err = parse_sandbox(
+            &["ro:src".to_string(), "full".to_string()],
+            None,
+            Path::new("/work"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot be mixed"));
     }
 
     #[test]
@@ -691,6 +728,9 @@ mod tests {
         assert!(err.to_string().contains("may only contain"));
 
         assert_eq!(sanitize_for_path("bad/name"), "bad_name");
-        assert_eq!(absolutize_from_cwd("/abs", Path::new("/work")), PathBuf::from("/abs"));
+        assert_eq!(
+            absolutize_from_cwd("/abs", Path::new("/work")),
+            PathBuf::from("/abs")
+        );
     }
 }

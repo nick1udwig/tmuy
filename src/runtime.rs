@@ -536,10 +536,18 @@ fn parse_signal(raw: &str) -> Result<Signal> {
 
 fn attach_input_loop(stream: &mut UnixStream, detach_sequence: &[u8]) -> Result<()> {
     let mut stdin = io::stdin();
+    attach_input_loop_from(&mut stdin, stream, detach_sequence)
+}
+
+fn attach_input_loop_from(
+    reader: &mut impl Read,
+    stream: &mut UnixStream,
+    detach_sequence: &[u8],
+) -> Result<()> {
     let mut pending = Vec::new();
     let mut buf = [0u8; 1];
     loop {
-        let n = stdin.read(&mut buf)?;
+        let n = reader.read(&mut buf)?;
         if n == 0 {
             let _ = stream.shutdown(Shutdown::Both);
             return Ok(());
@@ -711,16 +719,21 @@ impl Drop for RawModeGuard {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs;
+    use std::io::Cursor;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
 
     use chrono::Utc;
     use std::io::Write;
     use std::os::unix::net::UnixStream;
+    use tempfile::tempdir;
 
     use super::*;
     use crate::model::{CommandMode, FsGrant, NetworkMode, SandboxSpec, SessionStatus};
+    use crate::store::{CreateSessionRequest, Store};
 
     fn sample_session() -> SessionRecord {
         SessionRecord {
@@ -752,6 +765,23 @@ mod tests {
             env: BTreeMap::new(),
             detach_key: "C-b d".to_string(),
         }
+    }
+
+    fn make_store_and_session(command: Vec<String>) -> (tempfile::TempDir, Store, SessionRecord) {
+        let tmp = tempdir().unwrap();
+        let store = Store::from_base_dir(tmp.path().join(".tmuy")).unwrap();
+        let session = store
+            .create_session(CreateSessionRequest {
+                explicit_name: Some("srv".to_string()),
+                cwd: tmp.path().to_path_buf(),
+                command,
+                mode: CommandMode::OneShot,
+                sandbox: SandboxSpec::default(),
+                detach_key: "C-b d".to_string(),
+                env: BTreeMap::new(),
+            })
+            .unwrap();
+        (tmp, store, session)
     }
 
     #[test]
@@ -796,10 +826,7 @@ mod tests {
     fn broadcast_removes_dead_clients() {
         let output_state = Arc::new(Mutex::new(OutputState::new()));
         let (tx, rx) = mpsc::channel();
-        output_state
-            .lock()
-            .unwrap()
-            .register_client(1, tx);
+        output_state.lock().unwrap().register_client(1, tx);
         drop(rx);
         broadcast(&output_state, b"hello");
         assert!(output_state.lock().unwrap().broadcasters.is_empty());
@@ -808,7 +835,9 @@ mod tests {
     #[test]
     fn handle_client_input_and_unknown_mode_paths() {
         let shared = Arc::new(Mutex::new(Vec::new()));
-        let writer = Arc::new(Mutex::new(Box::new(SharedWriter(shared.clone())) as Box<dyn Write + Send>));
+        let writer = Arc::new(Mutex::new(
+            Box::new(SharedWriter(shared.clone())) as Box<dyn Write + Send>
+        ));
         let output_state = Arc::new(Mutex::new(OutputState::new()));
         let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(b"Ihello").unwrap();
@@ -825,7 +854,9 @@ mod tests {
         .unwrap();
         assert_eq!(&*shared.lock().unwrap(), b"hello");
 
-        let writer = Arc::new(Mutex::new(Box::new(SharedWriter(Arc::new(Mutex::new(Vec::new())))) as Box<dyn Write + Send>));
+        let writer = Arc::new(Mutex::new(
+            Box::new(SharedWriter(Arc::new(Mutex::new(Vec::new())))) as Box<dyn Write + Send>,
+        ));
         let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(b"STERM").unwrap();
         client.shutdown(Shutdown::Write).unwrap();
@@ -840,7 +871,9 @@ mod tests {
         )
         .unwrap();
 
-        let writer = Arc::new(Mutex::new(Box::new(SharedWriter(Arc::new(Mutex::new(Vec::new())))) as Box<dyn Write + Send>));
+        let writer = Arc::new(Mutex::new(
+            Box::new(SharedWriter(Arc::new(Mutex::new(Vec::new())))) as Box<dyn Write + Send>,
+        ));
         let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(b"X").unwrap();
         client.shutdown(Shutdown::Write).unwrap();
@@ -858,6 +891,35 @@ mod tests {
     }
 
     #[test]
+    fn handle_client_signal_mode_sends_signal_to_child_pid() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-lc", "trap 'exit 0' TERM; while :; do sleep 1; done"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+
+        let writer = Arc::new(Mutex::new(
+            Box::new(SharedWriter(Arc::new(Mutex::new(Vec::new())))) as Box<dyn Write + Send>,
+        ));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(b"STERM").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        handle_client(
+            server,
+            ServerState {
+                writer,
+                output_state: Arc::new(Mutex::new(OutputState::new())),
+                next_client_id: Arc::new(AtomicUsize::new(1)),
+                child_pid: Some(pid),
+            },
+        )
+        .unwrap();
+
+        let status = child.wait().unwrap();
+        assert!(!status.success() || status.code() == Some(0));
+    }
+
+    #[test]
     fn detach_and_signal_parsers_cover_error_cases() {
         assert_eq!(detach_sequence("C-a d").unwrap(), vec![0x01, b'd']);
         assert_eq!(parse_signal("HUP").unwrap(), Signal::SIGHUP);
@@ -870,9 +932,115 @@ mod tests {
 
     #[test]
     fn is_peer_closed_matches_expected_kinds() {
-        assert!(is_peer_closed(&io::Error::new(io::ErrorKind::BrokenPipe, "x")));
-        assert!(is_peer_closed(&io::Error::new(io::ErrorKind::ConnectionReset, "x")));
+        assert!(is_peer_closed(&io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "x"
+        )));
+        assert!(is_peer_closed(&io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "x"
+        )));
         assert!(!is_peer_closed(&io::Error::new(io::ErrorKind::Other, "x")));
+    }
+
+    #[test]
+    fn attach_input_loop_handles_eof_and_peer_closed() {
+        let (mut stream, peer) = UnixStream::pair().unwrap();
+        let mut empty = Cursor::new(Vec::<u8>::new());
+        attach_input_loop_from(&mut empty, &mut stream, b"\x02d").unwrap();
+        let mut buf = [0u8; 1];
+        let mut peer = peer;
+        assert_eq!(peer.read(&mut buf).unwrap(), 0);
+
+        let (mut stream, peer) = UnixStream::pair().unwrap();
+        peer.shutdown(Shutdown::Read).unwrap();
+        let mut reader = Cursor::new(vec![b'x']);
+        attach_input_loop_from(&mut reader, &mut stream, b"\x02d").unwrap();
+    }
+
+    #[test]
+    fn handle_attach_client_writer_thread_handles_peer_closed() {
+        let output_state = Arc::new(Mutex::new(OutputState::new()));
+        let writer = Arc::new(Mutex::new(
+            Box::new(SharedWriter(Arc::new(Mutex::new(Vec::new())))) as Box<dyn Write + Send>,
+        ));
+        let (client, server) = UnixStream::pair().unwrap();
+        let state = ServerState {
+            writer,
+            output_state: output_state.clone(),
+            next_client_id: Arc::new(AtomicUsize::new(1)),
+            child_pid: None,
+        };
+        let handle = thread::spawn(move || handle_attach_client(server, state));
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            if !output_state.lock().unwrap().broadcasters.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!output_state.lock().unwrap().broadcasters.is_empty());
+
+        client.shutdown(Shutdown::Read).unwrap();
+        broadcast(&output_state, b"hello");
+        let _ = client.shutdown(Shutdown::Write);
+
+        assert!(handle.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn status_bar_guard_render_handles_missing_rows() {
+        let session = sample_session();
+        let guard = StatusBarGuard {
+            session: session.clone(),
+            detach_key: "C-b d".to_string(),
+            rows: None,
+        };
+        let mut buf = Vec::new();
+        guard.render(&mut buf).unwrap();
+        assert!(buf.is_empty());
+
+        let guard = StatusBarGuard {
+            session,
+            detach_key: "C-b d".to_string(),
+            rows: Some(2),
+        };
+        guard.render(&mut buf).unwrap();
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn run_server_recreates_socket_parent_and_records_lifecycle() {
+        let (_tmp, store, session) = make_store_and_session(vec![
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            "printf ok".to_string(),
+        ]);
+        fs::remove_dir_all(store.live_dir()).unwrap();
+        run_server(&store, &session.id_hash).unwrap();
+
+        let updated = store.session_by_hash(&session.id_hash).unwrap();
+        assert_eq!(updated.status, SessionStatus::Exited);
+        let events = fs::read_to_string(updated.events_path).unwrap();
+        assert!(events.contains("\"kind\":\"live\""));
+        assert!(events.contains("\"kind\":\"exited\""));
+        assert!(fs::read_to_string(updated.log_path).unwrap().contains("ok"));
+    }
+
+    #[test]
+    fn run_server_removes_stale_socket_file() {
+        let (_tmp, store, session) = make_store_and_session(vec![
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            "printf stale".to_string(),
+        ]);
+        fs::write(&session.socket_path, b"stale").unwrap();
+        run_server(&store, &session.id_hash).unwrap();
+
+        let updated = store.session_by_hash(&session.id_hash).unwrap();
+        assert_eq!(updated.status, SessionStatus::Exited);
+        assert!(!updated.socket_path.exists());
     }
 
     #[derive(Clone)]

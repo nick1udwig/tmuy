@@ -134,6 +134,79 @@ fn failed_startup_is_reflected_in_json_inspect() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn json_outputs_cover_send_wait_kill_and_signal() -> Result<()> {
+    let home = TempDir::new()?;
+
+    let echoer = run_tmuy(
+        home.path(),
+        &[
+            "new",
+            "echoer",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "while IFS= read -r line; do printf 'E:%s\\n' \"$line\"; [ \"$line\" = quit ] && exit 7; done",
+        ],
+    )?;
+    assert_success(&echoer);
+
+    let sent = run_tmuy(home.path(), &["--json", "send", "echoer", "quit\n"])?;
+    assert_success(&sent);
+    let sent_json: Value = serde_json::from_slice(&sent.stdout)?;
+    assert_eq!(sent_json["ok"], true);
+    assert_eq!(sent_json["message"], "sent");
+
+    let waited = run_tmuy(
+        home.path(),
+        &["--json", "wait", "echoer", "--timeout-secs", "5"],
+    )?;
+    assert_success(&waited);
+    let waited_json: Value = serde_json::from_slice(&waited.stdout)?;
+    assert_eq!(waited_json["current_name"], "echoer");
+    assert_eq!(waited_json["exit_code"], 7);
+
+    let killme = run_tmuy(
+        home.path(),
+        &["new", "killme", "--", "/bin/sh", "-lc", "sleep 30"],
+    )?;
+    assert_success(&killme);
+
+    let killed = run_tmuy(home.path(), &["--json", "kill", "killme"])?;
+    assert_success(&killed);
+    let killed_json: Value = serde_json::from_slice(&killed.stdout)?;
+    assert_eq!(killed_json["ok"], true);
+    assert_eq!(killed_json["message"], "interrupted");
+    assert_success(&run_tmuy(
+        home.path(),
+        &["wait", "killme", "--timeout-secs", "5"],
+    )?);
+
+    let termy = run_tmuy(
+        home.path(),
+        &[
+            "new",
+            "termy",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "trap 'exit 0' TERM; while :; do sleep 1; done",
+        ],
+    )?;
+    assert_success(&termy);
+
+    let signaled = run_tmuy(home.path(), &["--json", "signal", "termy", "TERM"])?;
+    assert_success(&signaled);
+    let signaled_json: Value = serde_json::from_slice(&signaled.stdout)?;
+    assert_eq!(signaled_json["ok"], true);
+    assert_eq!(signaled_json["message"], "signaled");
+    assert_success(&run_tmuy(
+        home.path(),
+        &["wait", "termy", "--timeout-secs", "5"],
+    )?);
+    Ok(())
+}
+
 fn run_tmuy(home: &Path, args: &[&str]) -> Result<Output> {
     let output = Command::new(tmuy_bin())
         .args(args)

@@ -162,9 +162,9 @@ mod tests {
     use std::path::Path;
     use std::path::PathBuf;
 
-    use chrono::Utc;
     use super::*;
     use crate::model::{CommandMode, SessionStatus};
+    use chrono::Utc;
 
     fn sample_session(sandbox: SandboxSpec) -> SessionRecord {
         let mut env = BTreeMap::new();
@@ -176,7 +176,11 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             cwd: PathBuf::from("/tmp/demo"),
-            command: vec!["/bin/sh".to_string(), "-lc".to_string(), "printf ok".to_string()],
+            command: vec![
+                "/bin/sh".to_string(),
+                "-lc".to_string(),
+                "printf ok".to_string(),
+            ],
             mode: CommandMode::OneShot,
             sandbox,
             status: SessionStatus::Starting,
