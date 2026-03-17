@@ -652,6 +652,71 @@ fn tail_follow_streams_new_output() -> Result<()> {
 }
 
 #[test]
+fn tail_follow_by_name_survives_session_rename() -> Result<()> {
+    let home = TempDir::new()?;
+    let created = run_tmuy(
+        home.path(),
+        &[
+            "new",
+            "stream",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "while IFS= read -r line; do printf 'S:%s\\n' \"$line\"; [ \"$line\" = quit ] && exit 0; done",
+        ],
+    )?;
+    assert_success(&created);
+
+    let mut tail = spawn_output_tmuy(home.path(), &["tail", "-f", "stream"])?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    let renamed = run_tmuy(home.path(), &["rename", "stream", "moved"])?;
+    assert_success(&renamed);
+
+    let sent = run_tmuy(home.path(), &["send", "moved", "alpha"])?;
+    assert_success(&sent);
+    let output = tail.read_until_contains("S:alpha", Duration::from_secs(5))?;
+    assert!(output.contains("S:alpha"));
+
+    let quit = run_tmuy(home.path(), &["send", "moved", "quit"])?;
+    assert_success(&quit);
+    let status = tail.wait_for_exit(Duration::from_secs(5))?;
+    assert!(status.success(), "tail -f exit status was {status:?}");
+    Ok(())
+}
+
+#[test]
+fn wait_by_name_survives_session_rename() -> Result<()> {
+    let home = TempDir::new()?;
+    let created = run_tmuy(
+        home.path(),
+        &[
+            "new",
+            "watch",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "while IFS= read -r line; do [ \"$line\" = quit ] && exit 7; done",
+        ],
+    )?;
+    assert_success(&created);
+
+    let mut waited = spawn_output_tmuy(home.path(), &["wait", "watch", "--timeout-secs", "5"])?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    let renamed = run_tmuy(home.path(), &["rename", "watch", "moved"])?;
+    assert_success(&renamed);
+
+    let quit = run_tmuy(home.path(), &["send", "moved", "quit"])?;
+    assert_success(&quit);
+    let output = waited.read_until_contains("moved (", Duration::from_secs(5))?;
+    assert!(output.contains("exited with Some(7)"));
+    let status = waited.wait_for_exit(Duration::from_secs(5))?;
+    assert!(status.success(), "wait exit status was {status:?}");
+    Ok(())
+}
+
+#[test]
 fn signal_term_reaches_session_process_group() -> Result<()> {
     let home = TempDir::new()?;
     let created = run_tmuy(

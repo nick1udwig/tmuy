@@ -292,10 +292,12 @@ pub fn send_input(store: &Store, name: &str, bytes: &[u8]) -> Result<()> {
 
 pub fn tail(store: &Store, name: &str, raw: bool, follow: bool) -> Result<()> {
     let session = store.resolve_target(name, SessionScope::All)?;
+    let hash = session.id_hash.clone();
+    let log_path = session.log_path.clone();
     let mut position = 0u64;
     loop {
-        if session.log_path.exists() {
-            let mut file = File::open(&session.log_path)?;
+        if log_path.exists() {
+            let mut file = File::open(&log_path)?;
             let len = file.metadata()?.len();
             if len > position {
                 let to_read = (len - position) as usize;
@@ -315,9 +317,9 @@ pub fn tail(store: &Store, name: &str, raw: bool, follow: bool) -> Result<()> {
         if !follow {
             return Ok(());
         }
-        let refreshed = store.resolve_target(name, SessionScope::All)?;
-        if !refreshed.status.is_live() && refreshed.log_path.exists() {
-            let len = fs::metadata(&refreshed.log_path)?.len();
+        let refreshed = store.session_by_hash(&hash)?;
+        if !refreshed.status.is_live() && log_path.exists() {
+            let len = fs::metadata(&log_path)?.len();
             if len <= position {
                 return Ok(());
             }
@@ -351,9 +353,10 @@ pub fn wait_for_exit(
     name: &str,
     timeout: Option<Duration>,
 ) -> Result<SessionRecord> {
+    let hash = store.resolve_target(name, SessionScope::All)?.id_hash;
     let started = Instant::now();
     loop {
-        let session = store.resolve_target(name, SessionScope::All)?;
+        let session = store.session_by_hash(&hash)?;
         if !session.status.is_live() {
             return Ok(session);
         }
