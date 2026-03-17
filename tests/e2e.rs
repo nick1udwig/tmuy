@@ -3,6 +3,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -14,18 +15,37 @@ fn tmuy_bin() -> &'static str {
     env!("CARGO_BIN_EXE_tmuy")
 }
 
-fn linux_bwrap_available() -> bool {
-    if !cfg!(target_os = "linux") {
-        return false;
-    }
+fn linux_bwrap_supported() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        if !cfg!(target_os = "linux") {
+            return false;
+        }
 
-    Command::new("bwrap")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        Command::new("bwrap")
+            .args([
+                "--new-session",
+                "--die-with-parent",
+                "--unshare-all",
+                "--share-net",
+                "--dev-bind",
+                "/",
+                "/",
+                "--proc",
+                "/proc",
+                "--chdir",
+                "/",
+                "--",
+                "/bin/sh",
+                "-lc",
+                "true",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    })
 }
 
 struct AttachHarness {
@@ -417,8 +437,8 @@ fn kill_sends_ctrl_c_style_interrupt() -> Result<()> {
 
 #[test]
 fn sandbox_ro_denies_write() -> Result<()> {
-    if !linux_bwrap_available() {
-        eprintln!("skipping sandbox_ro_denies_write: bwrap is not installed");
+    if !linux_bwrap_supported() {
+        eprintln!("skipping sandbox_ro_denies_write: Linux bwrap sandbox is unavailable");
         return Ok(());
     }
 
@@ -451,8 +471,8 @@ fn sandbox_ro_denies_write() -> Result<()> {
 
 #[test]
 fn sandbox_rw_allows_write() -> Result<()> {
-    if !linux_bwrap_available() {
-        eprintln!("skipping sandbox_rw_allows_write: bwrap is not installed");
+    if !linux_bwrap_supported() {
+        eprintln!("skipping sandbox_rw_allows_write: Linux bwrap sandbox is unavailable");
         return Ok(());
     }
 
@@ -484,8 +504,10 @@ fn sandbox_rw_allows_write() -> Result<()> {
 
 #[test]
 fn sandbox_net_off_unshares_network_namespace() -> Result<()> {
-    if !linux_bwrap_available() {
-        eprintln!("skipping sandbox_net_off_unshares_network_namespace: bwrap is not installed");
+    if !linux_bwrap_supported() {
+        eprintln!(
+            "skipping sandbox_net_off_unshares_network_namespace: Linux bwrap sandbox is unavailable"
+        );
         return Ok(());
     }
 
