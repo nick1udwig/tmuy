@@ -245,7 +245,7 @@ pub fn run_server(store: &Store, hash: &str) -> Result<()> {
 }
 
 pub fn attach(store: &Store, name: &str, detach_key: &str) -> Result<()> {
-    let session = store.resolve_by_name(name, SessionScope::LiveOnly)?;
+    let session = store.resolve_target(name, SessionScope::LiveOnly)?;
     let stream = UnixStream::connect(&session.socket_path)
         .with_context(|| format!("failed to connect to {}", session.socket_path.display()))?;
     let mut write_stream = stream;
@@ -282,7 +282,7 @@ pub fn attach(store: &Store, name: &str, detach_key: &str) -> Result<()> {
 }
 
 pub fn send_input(store: &Store, name: &str, bytes: &[u8]) -> Result<()> {
-    let session = store.resolve_by_name(name, SessionScope::LiveOnly)?;
+    let session = store.resolve_target(name, SessionScope::LiveOnly)?;
     let mut stream = UnixStream::connect(&session.socket_path)?;
     stream.write_all(b"I")?;
     stream.write_all(bytes)?;
@@ -291,9 +291,7 @@ pub fn send_input(store: &Store, name: &str, bytes: &[u8]) -> Result<()> {
 }
 
 pub fn tail(store: &Store, name: &str, raw: bool, follow: bool) -> Result<()> {
-    let session = store
-        .resolve_by_name(name, SessionScope::All)
-        .or_else(|_| store.resolve_by_name(name, SessionScope::DeadOnly))?;
+    let session = store.resolve_target(name, SessionScope::All)?;
     let mut position = 0u64;
     loop {
         if session.log_path.exists() {
@@ -317,7 +315,7 @@ pub fn tail(store: &Store, name: &str, raw: bool, follow: bool) -> Result<()> {
         if !follow {
             return Ok(());
         }
-        let refreshed = store.resolve_by_name(name, SessionScope::All)?;
+        let refreshed = store.resolve_target(name, SessionScope::All)?;
         if !refreshed.status.is_live() && refreshed.log_path.exists() {
             let len = fs::metadata(&refreshed.log_path)?.len();
             if len <= position {
@@ -329,7 +327,7 @@ pub fn tail(store: &Store, name: &str, raw: bool, follow: bool) -> Result<()> {
 }
 
 pub fn signal_session(store: &Store, name: &str, signal_name: &str) -> Result<()> {
-    let session = store.resolve_by_name(name, SessionScope::LiveOnly)?;
+    let session = store.resolve_target(name, SessionScope::LiveOnly)?;
     let pid = session
         .child_pid
         .ok_or_else(|| anyhow!("session has no child pid yet: {name}"))?;
@@ -355,7 +353,7 @@ pub fn wait_for_exit(
 ) -> Result<SessionRecord> {
     let started = Instant::now();
     loop {
-        let session = store.resolve_by_name(name, SessionScope::All)?;
+        let session = store.resolve_target(name, SessionScope::All)?;
         if !session.status.is_live() {
             return Ok(session);
         }

@@ -86,7 +86,7 @@ struct NewArgs {
 
 #[derive(clap::Args, Debug)]
 struct AttachArgs {
-    /// Live session name to attach to.
+    /// Live session name or hash to attach to.
     name: String,
 
     /// Override the session's stored detach key for this attach client.
@@ -96,7 +96,7 @@ struct AttachArgs {
 
 #[derive(clap::Args, Debug)]
 struct KillArgs {
-    /// Live session name to interrupt.
+    /// Live session name or hash to interrupt.
     name: String,
 }
 
@@ -113,7 +113,7 @@ struct ListArgs {
 
 #[derive(clap::Args, Debug)]
 struct TailArgs {
-    /// Session name to read from.
+    /// Session name or hash to read from.
     name: String,
 
     /// Emit raw PTY bytes instead of cooked text.
@@ -127,13 +127,13 @@ struct TailArgs {
 
 #[derive(clap::Args, Debug)]
 struct NameArgs {
-    /// Session name to inspect.
+    /// Session name or hash to inspect.
     name: String,
 }
 
 #[derive(clap::Args, Debug)]
 struct SendArgs {
-    /// Live session name to write to.
+    /// Live session name or hash to write to.
     name: String,
 
     /// Literal payload to send. If omitted, tmuy reads bytes from stdin.
@@ -142,7 +142,7 @@ struct SendArgs {
 
 #[derive(clap::Args, Debug)]
 struct RenameArgs {
-    /// Current live session name.
+    /// Current live session name or hash.
     name: String,
     /// New live session name.
     new_name: String,
@@ -150,7 +150,7 @@ struct RenameArgs {
 
 #[derive(clap::Args, Debug)]
 struct WaitArgs {
-    /// Session name to wait on.
+    /// Session name or hash to wait on.
     name: String,
 
     /// Maximum time to wait before returning an error.
@@ -160,7 +160,7 @@ struct WaitArgs {
 
 #[derive(clap::Args, Debug)]
 struct SignalArgs {
-    /// Live session name to signal.
+    /// Live session name or hash to signal.
     name: String,
     /// Signal name such as `INT`, `TERM`, or `HUP`.
     signal: String,
@@ -185,7 +185,7 @@ pub fn run() -> Result<()> {
         Commands::New(args) => cmd_new(&store, cli.json, args),
         Commands::Attach(args) => {
             ensure_attach_allowed()?;
-            let session = store.resolve_by_name(&args.name, SessionScope::LiveOnly)?;
+            let session = store.resolve_target(&args.name, SessionScope::LiveOnly)?;
             let detach_key = args.detach_key.as_deref().unwrap_or(&session.detach_key);
             runtime::attach(&store, &args.name, detach_key)?;
             if cli.json {
@@ -211,7 +211,7 @@ pub fn run() -> Result<()> {
         Commands::Ls(args) => cmd_ls(&store, cli.json, args),
         Commands::Tail(args) => runtime::tail(&store, &args.name, args.raw, args.follow),
         Commands::Inspect(args) => {
-            let session = store.resolve_by_name(&args.name, SessionScope::All)?;
+            let session = store.resolve_target(&args.name, SessionScope::All)?;
             if cli.json {
                 print_json(&session)?;
             } else {

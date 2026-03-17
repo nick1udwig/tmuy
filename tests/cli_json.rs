@@ -20,10 +20,11 @@ fn new_inspect_and_rename_keep_stable_hash() -> Result<()> {
             "--json",
             "new",
             "alpha",
+            "--detached",
             "--",
             "/bin/sh",
             "-lc",
-            "printf hi",
+            "sleep 30",
         ],
     )?;
     assert_success(&created);
@@ -35,19 +36,25 @@ fn new_inspect_and_rename_keep_stable_hash() -> Result<()> {
     assert_eq!(created_json["current_name"], "alpha");
     assert_eq!(created_json["started_name"], "alpha");
 
-    let renamed = run_tmuy(home.path(), &["--json", "rename", "alpha", "beta"])?;
+    let renamed = run_tmuy(home.path(), &["--json", "rename", &id_hash, "beta"])?;
     assert_success(&renamed);
     let renamed_json: Value = serde_json::from_slice(&renamed.stdout)?;
     assert_eq!(renamed_json["id_hash"], id_hash);
     assert_eq!(renamed_json["current_name"], "beta");
     assert_eq!(renamed_json["started_name"], "alpha");
 
-    let inspect = run_tmuy(home.path(), &["--json", "inspect", "beta"])?;
+    let inspect = run_tmuy(home.path(), &["--json", "inspect", &id_hash])?;
     assert_success(&inspect);
     let inspect_json: Value = serde_json::from_slice(&inspect.stdout)?;
     assert_eq!(inspect_json["id_hash"], id_hash);
     assert_eq!(inspect_json["current_name"], "beta");
     assert_eq!(inspect_json["started_name"], "alpha");
+
+    assert_success(&run_tmuy(home.path(), &["kill", &id_hash])?);
+    assert_success(&run_tmuy(
+        home.path(),
+        &["wait", &id_hash, "--timeout-secs", "5"],
+    )?);
     Ok(())
 }
 
@@ -150,8 +157,14 @@ fn json_outputs_cover_send_wait_kill_and_signal() -> Result<()> {
         ],
     )?;
     assert_success(&echoer);
+    let echoer_json: Value =
+        serde_json::from_slice(&run_tmuy(home.path(), &["--json", "inspect", "echoer"])?.stdout)?;
+    let echoer_hash = echoer_json["id_hash"]
+        .as_str()
+        .context("missing echoer id_hash")?
+        .to_string();
 
-    let sent = run_tmuy(home.path(), &["--json", "send", "echoer", "quit\n"])?;
+    let sent = run_tmuy(home.path(), &["--json", "send", &echoer_hash, "quit\n"])?;
     assert_success(&sent);
     let sent_json: Value = serde_json::from_slice(&sent.stdout)?;
     assert_eq!(sent_json["ok"], true);
@@ -159,27 +172,36 @@ fn json_outputs_cover_send_wait_kill_and_signal() -> Result<()> {
 
     let waited = run_tmuy(
         home.path(),
-        &["--json", "wait", "echoer", "--timeout-secs", "5"],
+        &["--json", "wait", &echoer_hash, "--timeout-secs", "5"],
     )?;
     assert_success(&waited);
     let waited_json: Value = serde_json::from_slice(&waited.stdout)?;
     assert_eq!(waited_json["current_name"], "echoer");
     assert_eq!(waited_json["exit_code"], 7);
+    let tailed = run_tmuy(home.path(), &["tail", &echoer_hash])?;
+    assert_success(&tailed);
+    assert!(String::from_utf8_lossy(&tailed.stdout).contains("E:quit"));
 
     let killme = run_tmuy(
         home.path(),
         &["new", "killme", "--", "/bin/sh", "-lc", "sleep 30"],
     )?;
     assert_success(&killme);
+    let killme_json: Value =
+        serde_json::from_slice(&run_tmuy(home.path(), &["--json", "inspect", "killme"])?.stdout)?;
+    let killme_hash = killme_json["id_hash"]
+        .as_str()
+        .context("missing killme id_hash")?
+        .to_string();
 
-    let killed = run_tmuy(home.path(), &["--json", "kill", "killme"])?;
+    let killed = run_tmuy(home.path(), &["--json", "kill", &killme_hash])?;
     assert_success(&killed);
     let killed_json: Value = serde_json::from_slice(&killed.stdout)?;
     assert_eq!(killed_json["ok"], true);
     assert_eq!(killed_json["message"], "interrupted");
     assert_success(&run_tmuy(
         home.path(),
-        &["wait", "killme", "--timeout-secs", "5"],
+        &["wait", &killme_hash, "--timeout-secs", "5"],
     )?);
 
     let termy = run_tmuy(
@@ -194,15 +216,21 @@ fn json_outputs_cover_send_wait_kill_and_signal() -> Result<()> {
         ],
     )?;
     assert_success(&termy);
+    let termy_json: Value =
+        serde_json::from_slice(&run_tmuy(home.path(), &["--json", "inspect", "termy"])?.stdout)?;
+    let termy_hash = termy_json["id_hash"]
+        .as_str()
+        .context("missing termy id_hash")?
+        .to_string();
 
-    let signaled = run_tmuy(home.path(), &["--json", "signal", "termy", "TERM"])?;
+    let signaled = run_tmuy(home.path(), &["--json", "signal", &termy_hash, "TERM"])?;
     assert_success(&signaled);
     let signaled_json: Value = serde_json::from_slice(&signaled.stdout)?;
     assert_eq!(signaled_json["ok"], true);
     assert_eq!(signaled_json["message"], "signaled");
     assert_success(&run_tmuy(
         home.path(),
-        &["wait", "termy", "--timeout-secs", "5"],
+        &["wait", &termy_hash, "--timeout-secs", "5"],
     )?);
     Ok(())
 }

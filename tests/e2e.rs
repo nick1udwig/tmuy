@@ -218,8 +218,15 @@ fn attach_uses_session_detach_key_by_default() -> Result<()> {
     let home = TempDir::new()?;
     let created = run_tmuy(home.path(), &["new", "custom", "--detach-key", "C-a d"])?;
     assert_success(&created);
+    let inspect = run_tmuy(home.path(), &["--json", "inspect", "custom"])?;
+    assert_success(&inspect);
+    let inspect_json: serde_json::Value = serde_json::from_slice(&inspect.stdout)?;
+    let hash = inspect_json["id_hash"]
+        .as_str()
+        .context("missing id_hash in inspect --json output")?
+        .to_string();
 
-    let mut attach = spawn_attach(home.path(), &["attach", "custom"])?;
+    let mut attach = spawn_attach(home.path(), &["attach", &hash])?;
     let output = attach.read_until_contains("detach C-a d", Duration::from_secs(5))?;
     assert!(output.contains("tmuy custom"));
 

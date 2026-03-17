@@ -202,35 +202,8 @@ impl Store {
         })
     }
 
-    pub fn resolve_by_name(&self, name: &str, scope: SessionScope) -> Result<SessionRecord> {
-        self.with_locked_state(|state| {
-            let matches: Vec<SessionRecord> = state
-                .sessions
-                .iter()
-                .filter(|session| session.current_name == name)
-                .filter(|session| match scope {
-                    SessionScope::LiveOnly => session.status.is_live(),
-                    SessionScope::DeadOnly => !session.status.is_live(),
-                    SessionScope::All => true,
-                })
-                .cloned()
-                .collect();
-
-            match matches.as_slice() {
-                [] => Err(anyhow!("unknown session name: {name}")),
-                [single] => Ok(single.clone()),
-                _ => {
-                    if scope == SessionScope::All {
-                        if let Some(live) = matches.iter().find(|session| session.status.is_live()) {
-                            return Ok(live.clone());
-                        }
-                    }
-                    Err(anyhow!(
-                        "ambiguous session name: {name}; use a unique current name or target by hash in metadata"
-                    ))
-                }
-            }
-        })
+    pub fn resolve_target(&self, target: &str, scope: SessionScope) -> Result<SessionRecord> {
+        self.with_locked_state(|state| resolve_target_in_state(state, target, scope))
     }
 
     pub fn list_sessions(&self, scope: SessionScope) -> Result<Vec<SessionRecord>> {
@@ -293,7 +266,7 @@ impl Store {
         Ok(failed)
     }
 
-    pub fn rename_session(&self, current_name: &str, new_name: &str) -> Result<SessionRecord> {
+    pub fn rename_session(&self, current_target: &str, new_name: &str) -> Result<SessionRecord> {
         validate_name(new_name)?;
         let renamed = self.with_locked_state(|state| {
             if state
@@ -304,11 +277,12 @@ impl Store {
                 bail!("live session name already exists: {new_name}");
             }
 
+            let target = resolve_target_in_state(state, current_target, SessionScope::LiveOnly)?;
             let session = state
                 .sessions
                 .iter_mut()
-                .find(|session| session.current_name == current_name)
-                .ok_or_else(|| anyhow!("unknown session name: {current_name}"))?;
+                .find(|session| session.id_hash == target.id_hash)
+                .ok_or_else(|| anyhow!("unknown session target: {current_target}"))?;
             session.current_name = new_name.to_string();
             session.updated_at = Utc::now();
             Ok(session.clone())
@@ -370,6 +344,69 @@ impl Store {
         let file = File::create(&session.meta_path)?;
         serde_json::to_writer_pretty(file, session)?;
         Ok(())
+    }
+}
+
+fn resolve_target_in_state(
+    state: &StateFile,
+    target: &str,
+    scope: SessionScope,
+) -> Result<SessionRecord> {
+    let hash_match = state
+        .sessions
+        .iter()
+        .find(|session| session.id_hash == target && session_matches_scope(session, scope))
+        .cloned();
+    let name_match = resolve_name_in_state(state, target, scope);
+
+    match (hash_match, name_match) {
+        (Some(hash_session), Ok(name_session)) if hash_session.id_hash != name_session.id_hash => {
+            bail!(
+                "ambiguous session target: {target}; it matches hash {} and name {}",
+                hash_session.short_ref(),
+                name_session.short_ref()
+            )
+        }
+        (Some(hash_session), _) => Ok(hash_session),
+        (None, Ok(name_session)) => Ok(name_session),
+        (None, Err(name_err)) => Err(name_err),
+    }
+}
+
+fn resolve_name_in_state(
+    state: &StateFile,
+    name: &str,
+    scope: SessionScope,
+) -> Result<SessionRecord> {
+    let matches: Vec<SessionRecord> = state
+        .sessions
+        .iter()
+        .filter(|session| session.current_name == name)
+        .filter(|session| session_matches_scope(session, scope))
+        .cloned()
+        .collect();
+
+    match matches.as_slice() {
+        [] => Err(anyhow!("unknown session target: {name}")),
+        [single] => Ok(single.clone()),
+        _ => {
+            if scope == SessionScope::All {
+                if let Some(live) = matches.iter().find(|session| session.status.is_live()) {
+                    return Ok(live.clone());
+                }
+            }
+            Err(anyhow!(
+                "ambiguous session target: {name}; use a unique current name or the stable session hash"
+            ))
+        }
+    }
+}
+
+fn session_matches_scope(session: &SessionRecord, scope: SessionScope) -> bool {
+    match scope {
+        SessionScope::LiveOnly => session.status.is_live(),
+        SessionScope::DeadOnly => !session.status.is_live(),
+        SessionScope::All => true,
     }
 }
 
@@ -608,35 +645,49 @@ mod tests {
     }
 
     #[test]
-    fn resolve_by_name_prefers_live_in_all_scope() {
+    fn resolve_target_accepts_name_and_hash() {
+        let (_tmp, store) = make_store();
+        let created = store.create_session(base_request(Some("same"))).unwrap();
+
+        let by_name = store
+            .resolve_target("same", SessionScope::LiveOnly)
+            .unwrap();
+        let by_hash = store
+            .resolve_target(&created.id_hash, SessionScope::LiveOnly)
+            .unwrap();
+
+        assert_eq!(by_name.id_hash, created.id_hash);
+        assert_eq!(by_hash.id_hash, created.id_hash);
+    }
+
+    #[test]
+    fn resolve_target_prefers_live_name_in_all_scope() {
         let (_tmp, store) = make_store();
         let dead = store.create_session(base_request(Some("same"))).unwrap();
         store.mark_exited(&dead.id_hash, Some(0)).unwrap();
         let live = store.create_session(base_request(Some("same"))).unwrap();
-        let resolved = store.resolve_by_name("same", SessionScope::All).unwrap();
+        let resolved = store.resolve_target("same", SessionScope::All).unwrap();
         assert_eq!(resolved.id_hash, live.id_hash);
     }
 
     #[test]
-    fn resolve_by_name_errors_when_duplicate_dead_names_exist() {
+    fn resolve_target_errors_when_duplicate_dead_names_exist() {
         let (_tmp, store) = make_store();
         let first = store.create_session(base_request(Some("same"))).unwrap();
         store.mark_exited(&first.id_hash, Some(0)).unwrap();
         let second = store.create_session(base_request(Some("same"))).unwrap();
         store.mark_exited(&second.id_hash, Some(0)).unwrap();
-        let err = store
-            .resolve_by_name("same", SessionScope::All)
-            .unwrap_err();
-        assert!(err.to_string().contains("ambiguous session name"));
+        let err = store.resolve_target("same", SessionScope::All).unwrap_err();
+        assert!(err.to_string().contains("ambiguous session target"));
     }
 
     #[test]
-    fn resolve_by_name_dead_only_returns_dead_session() {
+    fn resolve_target_dead_only_returns_dead_session() {
         let (_tmp, store) = make_store();
         let created = store.create_session(base_request(Some("dead"))).unwrap();
         store.mark_exited(&created.id_hash, Some(0)).unwrap();
         let resolved = store
-            .resolve_by_name("dead", SessionScope::DeadOnly)
+            .resolve_target("dead", SessionScope::DeadOnly)
             .unwrap();
         assert_eq!(resolved.id_hash, created.id_hash);
         assert_eq!(resolved.status, SessionStatus::Exited);
@@ -661,12 +712,21 @@ mod tests {
     fn rename_unknown_and_collision_error() {
         let (_tmp, store) = make_store();
         let err = store.rename_session("missing", "next").unwrap_err();
-        assert!(err.to_string().contains("unknown session name"));
+        assert!(err.to_string().contains("unknown session target"));
 
         store.create_session(base_request(Some("one"))).unwrap();
         store.create_session(base_request(Some("two"))).unwrap();
         let err = store.rename_session("one", "two").unwrap_err();
         assert!(err.to_string().contains("live session name already exists"));
+    }
+
+    #[test]
+    fn rename_accepts_hash_target() {
+        let (_tmp, store) = make_store();
+        let created = store.create_session(base_request(Some("alpha"))).unwrap();
+        let renamed = store.rename_session(&created.id_hash, "beta").unwrap();
+        assert_eq!(renamed.current_name, "beta");
+        assert_eq!(renamed.id_hash, created.id_hash);
     }
 
     #[test]
