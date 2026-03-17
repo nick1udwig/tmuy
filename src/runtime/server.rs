@@ -3,13 +3,13 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
-use nix::sys::signal::kill as send_signal;
+use anyhow::{Result, anyhow, bail};
+use nix::sys::signal::{Signal, kill as send_signal};
 use nix::unistd::Pid;
 use portable_pty::{PtySize, native_pty_system};
 
@@ -109,57 +109,81 @@ pub fn run_server(store: &Store, hash: &str) -> Result<()> {
     let running = Arc::new(AtomicBool::new(true));
     let output_state: SharedOutputState = Arc::new(Mutex::new(OutputState::new()));
     let next_client_id = Arc::new(AtomicUsize::new(1));
+    let (fatal_tx, fatal_rx) = mpsc::channel::<String>();
 
     let read_running = running.clone();
     let read_output_state = output_state.clone();
     let read_log_path = session.log_path.clone();
+    let read_fatal_tx = fatal_tx.clone();
     let read_thread = thread::spawn(move || -> Result<()> {
-        let mut log_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(read_log_path)?;
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let chunk = buf[..n].to_vec();
-                    log_file.write_all(&chunk)?;
-                    log_file.flush()?;
-                    broadcast(&read_output_state, &chunk);
+        let result = (|| -> Result<()> {
+            let mut log_file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(read_log_path)?;
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let chunk = buf[..n].to_vec();
+                        log_file.write_all(&chunk)?;
+                        log_file.flush()?;
+                        broadcast(&read_output_state, &chunk);
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(err) => return Err(err.into()),
                 }
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(err) => return Err(err.into()),
             }
-        }
+            Ok(())
+        })();
         read_running.store(false, Ordering::SeqCst);
-        Ok(())
+        if let Err(err) = &result {
+            let _ = read_fatal_tx.send(err.to_string());
+        }
+        result
     });
 
     let exit_store = store.clone();
     let exit_hash = hash.to_string();
     let exit_socket_path = session.socket_path.clone();
     let exit_running = running.clone();
+    let wait_fatal_tx = fatal_tx.clone();
     let wait_thread = thread::spawn(move || -> Result<()> {
-        let status = child.wait()?;
+        let result = (|| -> Result<()> {
+            let status = child.wait()?;
+            let exit_code = Some(status.exit_code() as i32);
+            let updated = exit_store.mark_exited(&exit_hash, exit_code)?;
+            exit_store.append_event(
+                &updated,
+                EventRecord {
+                    ts: chrono::Utc::now(),
+                    kind: "exited".to_string(),
+                    detail: serde_json::json!({
+                        "exit_code": exit_code,
+                    }),
+                },
+            )?;
+            let _ = fs::remove_file(exit_socket_path);
+            Ok(())
+        })();
         exit_running.store(false, Ordering::SeqCst);
-        let exit_code = Some(status.exit_code() as i32);
-        let updated = exit_store.mark_exited(&exit_hash, exit_code)?;
-        exit_store.append_event(
-            &updated,
-            EventRecord {
-                ts: chrono::Utc::now(),
-                kind: "exited".to_string(),
-                detail: serde_json::json!({
-                    "exit_code": exit_code,
-                }),
-            },
-        )?;
-        let _ = fs::remove_file(exit_socket_path);
-        Ok(())
+        if let Err(err) = &result {
+            let _ = wait_fatal_tx.send(err.to_string());
+        }
+        result
     });
 
+    let mut fatal_error = None;
     while running.load(Ordering::SeqCst) {
+        match fatal_rx.try_recv() {
+            Ok(err) => {
+                fatal_error = Some(err);
+                running.store(false, Ordering::SeqCst);
+                break;
+            }
+            Err(TryRecvError::Disconnected | TryRecvError::Empty) => {}
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 let server_state = ServerState {
@@ -179,9 +203,22 @@ pub fn run_server(store: &Store, hash: &str) -> Result<()> {
         }
     }
 
-    let _ = read_thread.join();
-    let _ = wait_thread.join();
+    if fatal_error.is_some() {
+        if let Some(pid) = child_pid {
+            let _ = send_signal(Pid::from_raw(-(pid as i32)), Signal::SIGTERM);
+        }
+    }
+
+    read_thread
+        .join()
+        .map_err(|_| anyhow!("tmuy read thread panicked"))??;
+    wait_thread
+        .join()
+        .map_err(|_| anyhow!("tmuy wait thread panicked"))??;
     let _ = fs::remove_file(&session.socket_path);
+    if let Some(err) = fatal_error {
+        bail!("{err}");
+    }
     Ok(())
 }
 
@@ -510,6 +547,25 @@ mod tests {
         let updated = store.session_by_hash(&session.id_hash).unwrap();
         assert_eq!(updated.status, SessionStatus::Exited);
         assert!(!updated.socket_path.exists());
+    }
+
+    #[test]
+    fn run_server_surfaces_log_thread_failures() {
+        let (_tmp, store, session) = make_store_and_session(vec![
+            "/bin/sh".to_string(),
+            "-lc".to_string(),
+            "printf ok; sleep 30".to_string(),
+        ]);
+        let bad_log_path = session.started_log_dir.join("not-a-file");
+        fs::create_dir(&bad_log_path).unwrap();
+        store
+            .update_session(&session.id_hash, |record| {
+                record.log_path = bad_log_path.clone();
+            })
+            .unwrap();
+
+        let err = run_server(&store, &session.id_hash).unwrap_err();
+        assert!(!err.to_string().is_empty());
     }
 
     #[derive(Clone)]
