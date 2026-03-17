@@ -434,10 +434,38 @@ fn handle_attach_client(mut stream: UnixStream, state: ServerState) -> Result<()
 }
 
 fn detach_sequence(detach_key: &str) -> Result<Vec<u8>> {
-    match detach_key {
-        "C-b d" => Ok(vec![0x02, b'd']),
-        other => bail!("unsupported detach key format for now: {other}"),
+    let tokens = detach_key.split_whitespace().collect::<Vec<_>>();
+    if tokens.is_empty() {
+        bail!("detach key cannot be empty");
     }
+    let mut bytes = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        bytes.push(parse_detach_token(token)?);
+    }
+    Ok(bytes)
+}
+
+fn parse_detach_token(token: &str) -> Result<u8> {
+    if let Some(control) = token.strip_prefix("C-") {
+        let mut chars = control.chars();
+        let ch = chars
+            .next()
+            .ok_or_else(|| anyhow!("invalid control key token: {token}"))?;
+        if chars.next().is_some() || !ch.is_ascii() {
+            bail!("invalid control key token: {token}");
+        }
+        let lower = ch.to_ascii_lowercase() as u8;
+        return Ok(lower & 0x1f);
+    }
+
+    let mut chars = token.chars();
+    let ch = chars
+        .next()
+        .ok_or_else(|| anyhow!("invalid detach key token: {token}"))?;
+    if chars.next().is_some() || !ch.is_ascii() {
+        bail!("invalid detach key token: {token}");
+    }
+    Ok(ch as u8)
 }
 
 fn parse_signal(raw: &str) -> Result<Signal> {

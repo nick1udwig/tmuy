@@ -23,6 +23,7 @@
 - `tmuy new [name] -- <cmd...>` starts a one-off PTY command. The session exits when the process exits.
 - `attach` always requires a name.
 - Default detach sequence is tmux-style `Ctrl+B d`.
+- `attach --detach-key` currently supports space-separated single-byte tokens such as `C-b d` or `C-a d`.
 - `Ctrl+C` and `Ctrl+D` are passed to the child process normally.
 - Multiple clients may attach to the same live session.
 - Detached sessions may receive input via `tmuy send`.
@@ -115,5 +116,5 @@ Behavior:
 - Resize propagation
 - Full sandbox enforcement
 - Richer `tail/read/search`
-- Better detach-key customization
+- Richer detach-key syntax
 - Stronger transcript and end-to-end PTY coverage across Linux/macOS

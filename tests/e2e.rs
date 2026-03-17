@@ -114,7 +114,7 @@ fn attach_detaches_cleanly() -> Result<()> {
     let created = run_tmuy(home.path(), &["new", "demo"])?;
     assert_success(&created);
 
-    let mut attach = spawn_attach(home.path(), "demo")?;
+    let mut attach = spawn_attach(home.path(), &["attach", "demo"])?;
     std::thread::sleep(Duration::from_millis(500));
     attach.write_all(b"echo attach-ok\r")?;
     let output = attach.read_until_contains("attach-ok", Duration::from_secs(5))?;
@@ -135,7 +135,7 @@ fn attach_ctrl_c_exits_without_broken_pipe() -> Result<()> {
     )?;
     assert_success(&created);
 
-    let mut attach = spawn_attach(home.path(), "job")?;
+    let mut attach = spawn_attach(home.path(), &["attach", "job"])?;
     std::thread::sleep(Duration::from_millis(500));
     attach.write_all(&[0x03])?;
     let status = attach.wait_for_exit(Duration::from_secs(5))?;
@@ -150,6 +150,24 @@ fn attach_ctrl_c_exits_without_broken_pipe() -> Result<()> {
 
     let waited = run_tmuy(home.path(), &["wait", "job", "--timeout-secs", "5"])?;
     assert_success(&waited);
+    Ok(())
+}
+
+#[test]
+fn attach_custom_detach_key_works() -> Result<()> {
+    let home = TempDir::new()?;
+    let created = run_tmuy(home.path(), &["new", "custom"])?;
+    assert_success(&created);
+
+    let mut attach = spawn_attach(home.path(), &["attach", "custom", "--detach-key", "C-a d"])?;
+    std::thread::sleep(Duration::from_millis(500));
+    attach.write_all(b"echo custom-detach\r")?;
+    let output = attach.read_until_contains("custom-detach", Duration::from_secs(5))?;
+    assert!(output.contains("custom-detach"));
+
+    attach.write_all(&[0x01, b'd'])?;
+    let status = attach.wait_for_exit(Duration::from_secs(5))?;
+    assert!(status.success(), "attach exit status was {status:?}");
     Ok(())
 }
 
@@ -444,7 +462,7 @@ fn run_tmuy_in_dir(home: &Path, dir: &Path, args: &[&str]) -> Result<Output> {
     Ok(output)
 }
 
-fn spawn_attach(home: &std::path::Path, name: &str) -> Result<AttachHarness> {
+fn spawn_attach(home: &std::path::Path, args: &[&str]) -> Result<AttachHarness> {
     let pty = openpty(None, None)?;
     let master = File::from(pty.master);
     let slave = File::from(pty.slave);
@@ -453,13 +471,13 @@ fn spawn_attach(home: &std::path::Path, name: &str) -> Result<AttachHarness> {
     let stderr = Stdio::from(slave);
 
     let child = Command::new(tmuy_bin())
-        .args(["attach", name])
+        .args(args)
         .env("TMUY_HOME", home)
         .stdin(stdin)
         .stdout(stdout)
         .stderr(stderr)
         .spawn()
-        .with_context(|| format!("failed to spawn attach for {name}"))?;
+        .with_context(|| format!("failed to spawn attach for {:?}", args))?;
 
     Ok(AttachHarness { child, master })
 }
