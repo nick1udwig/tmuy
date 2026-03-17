@@ -4,23 +4,51 @@ on:
   push:
     branches:
       - master
-  release:
-    types:
-      - published
   workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
+  prepare-release:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
+      sha: ${{ steps.bump.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Bump patch version
+        id: bump
+        shell: bash
+        run: |
+          version="$(./scripts/bump-version.sh)"
+          tag="v${version}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml
+          git commit -m "release: ${tag} [skip ci]"
+          git push origin HEAD:${GITHUB_REF_NAME}
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
   test:
+    needs: prepare-release
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare-release.outputs.sha }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -45,6 +73,9 @@ jobs:
       - name: Smoke test release installer
         run: bash tests/install-script.sh
 
+      - name: Smoke test version bump script
+        run: bash tests/bump-version.sh
+
       - name: Format check
         run: cargo fmt --check
 
@@ -52,7 +83,9 @@ jobs:
         run: cargo test --locked
 
   build:
-    needs: test
+    needs:
+      - prepare-release
+      - test
     strategy:
       fail-fast: false
       matrix:
@@ -66,6 +99,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare-release.outputs.sha }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -84,18 +119,11 @@ jobs:
           restore-keys: |
             cargo-build-${{ runner.os }}-${{ matrix.target }}-
 
-      - name: Resolve version
-        id: version
-        shell: bash
-        run: |
-          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
-          echo "value=${version}" >> "${GITHUB_OUTPUT}"
-
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Package release archive
-        run: ./scripts/package-release.sh ${{ steps.version.outputs.value }} ${{ matrix.target }} target/${{ matrix.target }}/release/tmuy
+        run: ./scripts/package-release.sh ${{ needs.prepare-release.outputs.version }} ${{ matrix.target }} target/${{ matrix.target }}/release/tmuy
 
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v4
@@ -105,24 +133,11 @@ jobs:
           retention-days: 14
 
   publish-release:
-    if: github.event_name == 'release' && github.event.action == 'published'
-    needs: build
+    needs:
+      - prepare-release
+      - build
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
     steps:
-      - uses: actions/checkout@v5
-
-      - name: Verify release tag matches Cargo version
-        shell: bash
-        run: |
-          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
-          tag="${GITHUB_REF_NAME#v}"
-          if [[ "${tag}" != "${version}" ]]; then
-            echo "release tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}" >&2
-            exit 1
-          fi
-
       - name: Download packaged artifacts
         uses: actions/download-artifact@v5
         with:
@@ -130,7 +145,17 @@ jobs:
           pattern: tmuy-*
           merge-multiple: true
 
-      - name: Upload assets to GitHub release
+      - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+          RELEASE_TAG: ${{ needs.prepare-release.outputs.tag }}
+          RELEASE_SHA: ${{ needs.prepare-release.outputs.sha }}
+        run: |
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" dist/* --clobber
+          else
+            gh release create "${RELEASE_TAG}" dist/* \
+              --target "${RELEASE_SHA}" \
+              --title "${RELEASE_TAG}" \
+              --notes "Automated release for ${RELEASE_TAG}"
+          fi
