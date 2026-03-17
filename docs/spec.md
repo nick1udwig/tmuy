@@ -107,6 +107,7 @@ Behavior:
 
 - Sessions are hosted by a detached internal service process.
 - `attach` connects to a Unix socket and forwards raw terminal bytes.
+- New attach clients receive a bounded replay of recent PTY output before switching to live bytes, so an already-running shell prompt does not appear blank.
 - PTY output is broadcast to all attached clients and appended to `pty.log`.
 - Resize handling is stubbed for now and remains a post-MVP TODO.
 

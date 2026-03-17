@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::net::Shutdown;
@@ -21,7 +21,44 @@ use crate::model::{EventRecord, FsGrant, SessionRecord, SessionScope, SessionSta
 use crate::sandbox;
 use crate::store::Store;
 
-type BroadcastMap = Arc<Mutex<HashMap<usize, Sender<Vec<u8>>>>>;
+const MAX_HISTORY_BYTES: usize = 256 * 1024;
+
+type SharedOutputState = Arc<Mutex<OutputState>>;
+
+struct OutputState {
+    history: VecDeque<u8>,
+    broadcasters: HashMap<usize, Sender<Vec<u8>>>,
+}
+
+impl OutputState {
+    fn new() -> Self {
+        Self {
+            history: VecDeque::new(),
+            broadcasters: HashMap::new(),
+        }
+    }
+
+    fn record_chunk(&mut self, chunk: &[u8]) -> Vec<(usize, Sender<Vec<u8>>)> {
+        self.history.extend(chunk.iter().copied());
+        while self.history.len() > MAX_HISTORY_BYTES {
+            self.history.pop_front();
+        }
+        self.broadcasters
+            .iter()
+            .map(|(id, tx)| (*id, tx.clone()))
+            .collect()
+    }
+
+    fn register_client(&mut self, id: usize, tx: Sender<Vec<u8>>) -> Vec<u8> {
+        let snapshot = self.history.iter().copied().collect::<Vec<_>>();
+        self.broadcasters.insert(id, tx);
+        snapshot
+    }
+
+    fn remove_client(&mut self, id: usize) {
+        self.broadcasters.remove(&id);
+    }
+}
 
 pub fn default_shell_command() -> Vec<String> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
@@ -125,11 +162,11 @@ pub fn run_server(store: &Store, hash: &str) -> Result<()> {
     let mut reader = pair.master.try_clone_reader()?;
     let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
     let running = Arc::new(AtomicBool::new(true));
-    let broadcasters: BroadcastMap = Arc::new(Mutex::new(HashMap::new()));
+    let output_state: SharedOutputState = Arc::new(Mutex::new(OutputState::new()));
     let next_client_id = Arc::new(AtomicUsize::new(1));
 
     let read_running = running.clone();
-    let read_broadcasters = broadcasters.clone();
+    let read_output_state = output_state.clone();
     let read_log_path = session.log_path.clone();
     let read_thread = thread::spawn(move || -> Result<()> {
         let mut log_file = OpenOptions::new()
@@ -144,7 +181,7 @@ pub fn run_server(store: &Store, hash: &str) -> Result<()> {
                     let chunk = buf[..n].to_vec();
                     log_file.write_all(&chunk)?;
                     log_file.flush()?;
-                    broadcast(&read_broadcasters, &chunk);
+                    broadcast(&read_output_state, &chunk);
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
                 Err(err) => return Err(err.into()),
@@ -182,7 +219,7 @@ pub fn run_server(store: &Store, hash: &str) -> Result<()> {
             Ok((stream, _)) => {
                 let server_state = ServerState {
                     writer: writer.clone(),
-                    broadcasters: broadcasters.clone(),
+                    output_state: output_state.clone(),
                     next_client_id: next_client_id.clone(),
                     child_pid,
                 };
@@ -329,22 +366,31 @@ fn sandbox_supported(session: &SessionRecord) -> bool {
         || cfg!(target_os = "linux")
 }
 
-fn broadcast(broadcasters: &BroadcastMap, chunk: &[u8]) {
+fn broadcast(output_state: &SharedOutputState, chunk: &[u8]) {
+    let senders = {
+        let mut state = output_state.lock().expect("output state poisoned");
+        state.record_chunk(chunk)
+    };
+
     let mut dead = Vec::new();
-    let mut map = broadcasters.lock().expect("broadcast map poisoned");
-    for (id, tx) in map.iter() {
+    for (id, tx) in senders {
         if tx.send(chunk.to_vec()).is_err() {
-            dead.push(*id);
+            dead.push(id);
         }
     }
+    if dead.is_empty() {
+        return;
+    }
+
+    let mut state = output_state.lock().expect("output state poisoned");
     for id in dead {
-        map.remove(&id);
+        state.remove_client(id);
     }
 }
 
 struct ServerState {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    broadcasters: BroadcastMap,
+    output_state: SharedOutputState,
     next_client_id: Arc<AtomicUsize>,
     child_pid: Option<u32>,
 }
@@ -378,13 +424,16 @@ fn handle_client(mut stream: UnixStream, state: ServerState) -> Result<()> {
 fn handle_attach_client(mut stream: UnixStream, state: ServerState) -> Result<()> {
     let client_id = state.next_client_id.fetch_add(1, Ordering::SeqCst);
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    state
-        .broadcasters
-        .lock()
-        .expect("broadcast map poisoned")
-        .insert(client_id, tx);
-
     let mut write_stream = stream.try_clone()?;
+    let history = {
+        let mut output_state = state.output_state.lock().expect("output state poisoned");
+        output_state.register_client(client_id, tx)
+    };
+    if !history.is_empty() {
+        write_stream.write_all(&history)?;
+        write_stream.flush()?;
+    }
+
     let writer_thread = thread::spawn(move || -> Result<()> {
         while let Ok(chunk) = rx.recv() {
             if let Err(err) = write_stream.write_all(&chunk) {
@@ -415,20 +464,20 @@ fn handle_attach_client(mut stream: UnixStream, state: ServerState) -> Result<()
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) => {
                 state
-                    .broadcasters
+                    .output_state
                     .lock()
-                    .expect("broadcast map poisoned")
-                    .remove(&client_id);
+                    .expect("output state poisoned")
+                    .remove_client(client_id);
                 return Err(err.into());
             }
         }
     }
 
     state
-        .broadcasters
+        .output_state
         .lock()
-        .expect("broadcast map poisoned")
-        .remove(&client_id);
+        .expect("output state poisoned")
+        .remove_client(client_id);
     let _ = writer_thread.join();
     Ok(())
 }

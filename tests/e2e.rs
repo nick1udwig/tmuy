@@ -172,6 +172,38 @@ fn attach_custom_detach_key_works() -> Result<()> {
 }
 
 #[test]
+fn attach_replays_existing_output() -> Result<()> {
+    let home = TempDir::new()?;
+    let created = run_tmuy(
+        home.path(),
+        &[
+            "new",
+            "replay",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "printf READY; sleep 30",
+        ],
+    )?;
+    assert_success(&created);
+
+    std::thread::sleep(Duration::from_millis(500));
+    let mut attach = spawn_attach(home.path(), &["attach", "replay"])?;
+    let output = attach.read_until_contains("READY", Duration::from_secs(5))?;
+    assert!(output.contains("READY"));
+
+    attach.write_all(&[0x02, b'd'])?;
+    let status = attach.wait_for_exit(Duration::from_secs(5))?;
+    assert!(status.success(), "attach exit status was {status:?}");
+
+    let interrupted = run_tmuy(home.path(), &["kill", "replay"])?;
+    assert_success(&interrupted);
+    let waited = run_tmuy(home.path(), &["wait", "replay", "--timeout-secs", "5"])?;
+    assert_success(&waited);
+    Ok(())
+}
+
+#[test]
 fn kill_sends_ctrl_c_style_interrupt() -> Result<()> {
     let home = TempDir::new()?;
     let created = run_tmuy(
