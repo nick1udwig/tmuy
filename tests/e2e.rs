@@ -15,6 +15,21 @@ fn tmuy_bin() -> &'static str {
     env!("CARGO_BIN_EXE_tmuy")
 }
 
+fn skip_ci_if_linux_bwrap_unavailable(test_name: &str) -> Option<String> {
+    if !cfg!(target_os = "linux") {
+        return Some(format!("skipping {test_name}: Linux-only sandbox test"));
+    }
+    if std::env::var_os("CI").is_none() {
+        return None;
+    }
+    if linux_bwrap_supported() {
+        return None;
+    }
+    Some(format!(
+        "skipping {test_name} on CI: Linux bwrap sandbox is unavailable"
+    ))
+}
+
 fn linux_bwrap_supported() -> bool {
     static SUPPORTED: OnceLock<bool> = OnceLock::new();
     *SUPPORTED.get_or_init(|| {
@@ -437,8 +452,8 @@ fn kill_sends_ctrl_c_style_interrupt() -> Result<()> {
 
 #[test]
 fn sandbox_ro_denies_write() -> Result<()> {
-    if !linux_bwrap_supported() {
-        eprintln!("skipping sandbox_ro_denies_write: Linux bwrap sandbox is unavailable");
+    if let Some(reason) = skip_ci_if_linux_bwrap_unavailable("sandbox_ro_denies_write") {
+        eprintln!("{reason}");
         return Ok(());
     }
 
@@ -471,8 +486,8 @@ fn sandbox_ro_denies_write() -> Result<()> {
 
 #[test]
 fn sandbox_rw_allows_write() -> Result<()> {
-    if !linux_bwrap_supported() {
-        eprintln!("skipping sandbox_rw_allows_write: Linux bwrap sandbox is unavailable");
+    if let Some(reason) = skip_ci_if_linux_bwrap_unavailable("sandbox_rw_allows_write") {
+        eprintln!("{reason}");
         return Ok(());
     }
 
@@ -504,10 +519,10 @@ fn sandbox_rw_allows_write() -> Result<()> {
 
 #[test]
 fn sandbox_net_off_unshares_network_namespace() -> Result<()> {
-    if !linux_bwrap_supported() {
-        eprintln!(
-            "skipping sandbox_net_off_unshares_network_namespace: Linux bwrap sandbox is unavailable"
-        );
+    if let Some(reason) =
+        skip_ci_if_linux_bwrap_unavailable("sandbox_net_off_unshares_network_namespace")
+    {
+        eprintln!("{reason}");
         return Ok(());
     }
 
