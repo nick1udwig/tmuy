@@ -17,7 +17,7 @@ version = 4
 
 [[package]]
 name = "tmuy"
-version = "1.2.3"
+version = "1.2.0"
 EOF
 
 next_version="$("${repo_root}/scripts/bump-version.sh" "${tmp_dir}/Cargo.toml" "${tmp_dir}/Cargo.lock")"
@@ -25,6 +25,6 @@ next_version="$("${repo_root}/scripts/bump-version.sh" "${tmp_dir}/Cargo.toml" "
 grep -q '^version = "1.2.4"$' "${tmp_dir}/Cargo.toml"
 ! grep -q '^version = "1.2.3"$' "${tmp_dir}/Cargo.toml"
 grep -q '^version = "1.2.4"$' "${tmp_dir}/Cargo.lock"
-! grep -q '^version = "1.2.3"$' "${tmp_dir}/Cargo.lock"
+! grep -q '^version = "1.2.0"$' "${tmp_dir}/Cargo.lock"
 
 printf 'bump-version smoke test passed\n'
