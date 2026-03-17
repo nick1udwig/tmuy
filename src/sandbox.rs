@@ -157,9 +157,42 @@ fn path_arg(path: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
     use std::path::Path;
+    use std::path::PathBuf;
 
+    use chrono::Utc;
     use super::*;
+    use crate::model::{CommandMode, SessionStatus};
+
+    fn sample_session(sandbox: SandboxSpec) -> SessionRecord {
+        let mut env = BTreeMap::new();
+        env.insert("TEST_ENV".to_string(), "VALUE".to_string());
+        SessionRecord {
+            id_hash: "1a2b3c4".to_string(),
+            started_name: "demo".to_string(),
+            current_name: "demo".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            cwd: PathBuf::from("/tmp/demo"),
+            command: vec!["/bin/sh".to_string(), "-lc".to_string(), "printf ok".to_string()],
+            mode: CommandMode::OneShot,
+            sandbox,
+            status: SessionStatus::Starting,
+            started_log_dir: PathBuf::from("/tmp/log"),
+            meta_path: PathBuf::from("/tmp/log/meta.json"),
+            log_path: PathBuf::from("/tmp/log/pty.log"),
+            events_path: PathBuf::from("/tmp/log/events.jsonl"),
+            socket_path: PathBuf::from("/tmp/log/live.sock"),
+            service_pid: None,
+            child_pid: None,
+            exit_code: None,
+            failure_reason: None,
+            env,
+            detach_key: "C-b d".to_string(),
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -170,5 +203,46 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("not covered"));
+    }
+
+    #[test]
+    fn default_sandbox_uses_plain_command() {
+        let builder = build_command(&sample_session(SandboxSpec::default())).unwrap();
+        let debug = format!("{builder:?}");
+        assert!(debug.contains("/bin/sh"));
+        assert!(debug.contains("printf ok"));
+        assert!(debug.contains("/tmp/demo"));
+        assert!(debug.contains("TEST_ENV"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_fs_non_default_sandbox_uses_bwrap_full_branch() {
+        let session = sample_session(SandboxSpec {
+            fs: vec![FsGrant::Full],
+            net: NetworkMode::Off,
+        });
+        let builder = linux_bwrap_command(&session).unwrap();
+        let debug = format!("{builder:?}");
+        assert!(debug.contains("bwrap"));
+        assert!(debug.contains("--dev-bind"));
+        assert!(debug.contains("/proc"));
+        assert!(!debug.contains("--share-net"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grant_allows_cwd_accepts_full() {
+        assert!(grant_allows_cwd(&FsGrant::Full, Path::new("/anywhere")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn path_arg_rejects_non_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_vec(vec![0xff, 0xfe]));
+        let err = path_arg(&path).unwrap_err();
+        assert!(err.to_string().contains("non-utf8"));
     }
 }

@@ -108,3 +108,24 @@ pub struct EventRecord {
     pub kind: String,
     pub detail: serde_json::Value,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_and_short_ref_work() {
+        let sandbox = SandboxSpec::default();
+        assert_eq!(NetworkMode::default(), NetworkMode::On);
+        assert_eq!(sandbox.net, NetworkMode::On);
+        assert_eq!(sandbox.fs, vec![FsGrant::Full]);
+    }
+
+    #[test]
+    fn session_status_is_live_only_for_starting_and_live() {
+        assert!(SessionStatus::Starting.is_live());
+        assert!(SessionStatus::Live.is_live());
+        assert!(!SessionStatus::Exited.is_live());
+        assert!(!SessionStatus::Failed.is_live());
+    }
+}

@@ -712,8 +712,12 @@ impl Drop for RawModeGuard {
 mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
 
     use chrono::Utc;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
 
     use super::*;
     use crate::model::{CommandMode, FsGrant, NetworkMode, SandboxSpec, SessionStatus};
@@ -768,5 +772,120 @@ mod tests {
         let line = format_status_bar(&session, "C-b d", 20);
         assert_eq!(line.len(), 20);
         assert!(line.ends_with("..."));
+    }
+
+    #[test]
+    fn fit_status_content_handles_zero_and_tiny_widths() {
+        assert_eq!(format_status_bar(&sample_session(), "C-b d", 0), "");
+        assert_eq!(fit_status_content("abcdef", 3), "...");
+        assert_eq!(fit_status_content("abcdef", 2), "..");
+    }
+
+    #[test]
+    fn output_state_trims_history_and_registers_snapshot() {
+        let mut state = OutputState::new();
+        let oversized = vec![b'x'; MAX_HISTORY_BYTES + 10];
+        let _ = state.record_chunk(&oversized);
+        let (tx, _rx) = mpsc::channel();
+        let snapshot = state.register_client(1, tx);
+        assert_eq!(snapshot.len(), MAX_HISTORY_BYTES);
+        assert!(snapshot.iter().all(|byte| *byte == b'x'));
+    }
+
+    #[test]
+    fn broadcast_removes_dead_clients() {
+        let output_state = Arc::new(Mutex::new(OutputState::new()));
+        let (tx, rx) = mpsc::channel();
+        output_state
+            .lock()
+            .unwrap()
+            .register_client(1, tx);
+        drop(rx);
+        broadcast(&output_state, b"hello");
+        assert!(output_state.lock().unwrap().broadcasters.is_empty());
+    }
+
+    #[test]
+    fn handle_client_input_and_unknown_mode_paths() {
+        let shared = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::new(Mutex::new(Box::new(SharedWriter(shared.clone())) as Box<dyn Write + Send>));
+        let output_state = Arc::new(Mutex::new(OutputState::new()));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(b"Ihello").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        handle_client(
+            server,
+            ServerState {
+                writer,
+                output_state: output_state.clone(),
+                next_client_id: Arc::new(AtomicUsize::new(1)),
+                child_pid: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(&*shared.lock().unwrap(), b"hello");
+
+        let writer = Arc::new(Mutex::new(Box::new(SharedWriter(Arc::new(Mutex::new(Vec::new())))) as Box<dyn Write + Send>));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(b"STERM").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        handle_client(
+            server,
+            ServerState {
+                writer,
+                output_state,
+                next_client_id: Arc::new(AtomicUsize::new(1)),
+                child_pid: None,
+            },
+        )
+        .unwrap();
+
+        let writer = Arc::new(Mutex::new(Box::new(SharedWriter(Arc::new(Mutex::new(Vec::new())))) as Box<dyn Write + Send>));
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(b"X").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let err = handle_client(
+            server,
+            ServerState {
+                writer,
+                output_state: Arc::new(Mutex::new(OutputState::new())),
+                next_client_id: Arc::new(AtomicUsize::new(1)),
+                child_pid: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown client mode byte"));
+    }
+
+    #[test]
+    fn detach_and_signal_parsers_cover_error_cases() {
+        assert_eq!(detach_sequence("C-a d").unwrap(), vec![0x01, b'd']);
+        assert_eq!(parse_signal("HUP").unwrap(), Signal::SIGHUP);
+        assert_eq!(parse_signal("KILL").unwrap(), Signal::SIGKILL);
+        assert!(detach_sequence("").is_err());
+        assert!(parse_detach_token("C-ab").is_err());
+        assert!(parse_detach_token("xy").is_err());
+        assert!(parse_signal("BOGUS").is_err());
+    }
+
+    #[test]
+    fn is_peer_closed_matches_expected_kinds() {
+        assert!(is_peer_closed(&io::Error::new(io::ErrorKind::BrokenPipe, "x")));
+        assert!(is_peer_closed(&io::Error::new(io::ErrorKind::ConnectionReset, "x")));
+        assert!(!is_peer_closed(&io::Error::new(io::ErrorKind::Other, "x")));
+    }
+
+    #[derive(Clone)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 }

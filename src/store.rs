@@ -386,6 +386,9 @@ pub fn parse_sandbox(
 
     let mut grants = Vec::new();
     for raw in fs_flags {
+        if matches!(grants.as_slice(), [FsGrant::Full]) {
+            bail!("--fs full cannot be mixed with ro:/rw: grants");
+        }
         if raw == "full" {
             if !grants.is_empty() {
                 bail!("--fs full cannot be mixed with ro:/rw: grants");
@@ -445,11 +448,14 @@ fn absolutize_from_cwd(raw_path: &str, cwd: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Mutex;
 
     use tempfile::tempdir;
 
     use super::*;
     use crate::model::{CommandMode, SessionScope, SessionStatus};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn make_store() -> (tempfile::TempDir, Store) {
         let tmp = tempdir().unwrap();
@@ -540,5 +546,151 @@ mod tests {
                 FsGrant::ReadWrite(PathBuf::from("/work/target"))
             ]
         );
+    }
+
+    #[test]
+    fn store_new_uses_env_override_and_home_fallback() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempdir().unwrap();
+        unsafe {
+            std::env::set_var("TMUY_HOME", tmp.path().join("override"));
+        }
+        let env_store = Store::new().unwrap();
+        assert!(env_store.base_dir().ends_with("override"));
+
+        unsafe {
+            std::env::remove_var("TMUY_HOME");
+        }
+        let home_store = Store::new().unwrap();
+        assert!(home_store.base_dir().ends_with(".tmuy"));
+    }
+
+    #[test]
+    fn empty_state_file_is_treated_as_default() {
+        let (_tmp, store) = make_store();
+        std::fs::write(store.state_path(), b"").unwrap();
+        let sessions = store.list_sessions(SessionScope::All).unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn invalid_state_file_returns_parse_error() {
+        let (_tmp, store) = make_store();
+        std::fs::write(store.state_path(), b"{invalid").unwrap();
+        let err = store.list_sessions(SessionScope::All).unwrap_err();
+        assert!(err.to_string().contains("failed to parse"));
+    }
+
+    #[test]
+    fn session_by_hash_unknown_errors() {
+        let (_tmp, store) = make_store();
+        let err = store.session_by_hash("missing").unwrap_err();
+        assert!(err.to_string().contains("unknown session hash"));
+    }
+
+    #[test]
+    fn resolve_by_name_prefers_live_in_all_scope() {
+        let (_tmp, store) = make_store();
+        let dead = store.create_session(base_request(Some("same"))).unwrap();
+        store.mark_exited(&dead.id_hash, Some(0)).unwrap();
+        let live = store.create_session(base_request(Some("same"))).unwrap();
+        let resolved = store.resolve_by_name("same", SessionScope::All).unwrap();
+        assert_eq!(resolved.id_hash, live.id_hash);
+    }
+
+    #[test]
+    fn resolve_by_name_errors_when_duplicate_dead_names_exist() {
+        let (_tmp, store) = make_store();
+        let first = store.create_session(base_request(Some("same"))).unwrap();
+        store.mark_exited(&first.id_hash, Some(0)).unwrap();
+        let second = store.create_session(base_request(Some("same"))).unwrap();
+        store.mark_exited(&second.id_hash, Some(0)).unwrap();
+        let err = store.resolve_by_name("same", SessionScope::All).unwrap_err();
+        assert!(err.to_string().contains("ambiguous session name"));
+    }
+
+    #[test]
+    fn mark_failed_and_mark_live_update_failure_reason() {
+        let (_tmp, store) = make_store();
+        let created = store.create_session(base_request(Some("alpha"))).unwrap();
+        let failed = store.mark_failed(&created.id_hash, "boom").unwrap();
+        assert_eq!(failed.status, SessionStatus::Failed);
+        assert_eq!(failed.failure_reason.as_deref(), Some("boom"));
+        let live = store.mark_live(&created.id_hash, 10, Some(11)).unwrap();
+        assert_eq!(live.status, SessionStatus::Live);
+        assert_eq!(live.failure_reason, None);
+    }
+
+    #[test]
+    fn rename_unknown_and_collision_error() {
+        let (_tmp, store) = make_store();
+        let err = store.rename_session("missing", "next").unwrap_err();
+        assert!(err.to_string().contains("unknown session name"));
+
+        store.create_session(base_request(Some("one"))).unwrap();
+        store.create_session(base_request(Some("two"))).unwrap();
+        let err = store.rename_session("one", "two").unwrap_err();
+        assert!(err.to_string().contains("live session name already exists"));
+    }
+
+    #[test]
+    fn update_unknown_hash_errors() {
+        let (_tmp, store) = make_store();
+        let err = store
+            .update_session("missing", |session| session.current_name = "x".to_string())
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown session hash"));
+    }
+
+    #[test]
+    fn append_event_and_write_meta_create_parent_dirs() {
+        let (_tmp, store) = make_store();
+        let mut session = store.create_session(base_request(Some("alpha"))).unwrap();
+        session.events_path = store.base_dir().join("nested/events/out.jsonl");
+        session.meta_path = store.base_dir().join("nested/meta/out.json");
+        store
+            .append_event(
+                &session,
+                EventRecord {
+                    ts: Utc::now(),
+                    kind: "x".to_string(),
+                    detail: serde_json::json!({"ok": true}),
+                },
+            )
+            .unwrap();
+        store.write_meta(&session).unwrap();
+        assert!(session.events_path.exists());
+        assert!(session.meta_path.exists());
+    }
+
+    #[test]
+    fn parse_sandbox_validation_errors() {
+        let err = parse_sandbox(&[], Some("bad"), Path::new("/work")).unwrap_err();
+        assert!(err.to_string().contains("invalid --net"));
+
+        let err = parse_sandbox(
+            &["full".to_string(), "ro:src".to_string()],
+            None,
+            Path::new("/work"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot be mixed"));
+
+        let err = parse_sandbox(&["oops".to_string()], None, Path::new("/work")).unwrap_err();
+        assert!(err.to_string().contains("invalid --fs value"));
+
+        let err = parse_sandbox(&["xx:src".to_string()], None, Path::new("/work")).unwrap_err();
+        assert!(err.to_string().contains("invalid --fs mode"));
+    }
+
+    #[test]
+    fn validate_name_and_path_helpers_cover_error_cases() {
+        let err = validate_name("").unwrap_err();
+        assert!(err.to_string().contains("cannot be empty"));
+        let err = validate_name("bad/name").unwrap_err();
+        assert!(err.to_string().contains("may only contain"));
+
+        assert_eq!(sanitize_for_path("bad/name"), "bad_name");
+        assert_eq!(absolutize_from_cwd("/abs", Path::new("/work")), PathBuf::from("/abs"));
     }
 }

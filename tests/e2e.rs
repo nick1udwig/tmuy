@@ -123,6 +123,10 @@ fn attach_detaches_cleanly() -> Result<()> {
     attach.write_all(&[0x02, b'd'])?;
     let status = attach.wait_for_exit(Duration::from_secs(5))?;
     assert!(status.success(), "attach exit status was {status:?}");
+    let sent = run_tmuy(home.path(), &["send", "demo", "exit\n"])?;
+    assert_success(&sent);
+    let waited = run_tmuy(home.path(), &["wait", "demo", "--timeout-secs", "5"])?;
+    assert_success(&waited);
     Ok(())
 }
 
@@ -168,6 +172,10 @@ fn attach_custom_detach_key_works() -> Result<()> {
     attach.write_all(&[0x01, b'd'])?;
     let status = attach.wait_for_exit(Duration::from_secs(5))?;
     assert!(status.success(), "attach exit status was {status:?}");
+    let sent = run_tmuy(home.path(), &["send", "custom", "exit\n"])?;
+    assert_success(&sent);
+    let waited = run_tmuy(home.path(), &["wait", "custom", "--timeout-secs", "5"])?;
+    assert_success(&waited);
     Ok(())
 }
 
