@@ -19,6 +19,11 @@ struct AttachHarness {
     master: File,
 }
 
+struct OutputHarness {
+    child: Child,
+    stdout: std::process::ChildStdout,
+}
+
 impl AttachHarness {
     fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
         self.master.write_all(bytes)?;
@@ -67,6 +72,39 @@ impl AttachHarness {
             std::thread::sleep(Duration::from_millis(50));
         }
         bail!("timed out waiting for attach process to exit")
+    }
+}
+
+impl OutputHarness {
+    fn read_until_contains(&mut self, needle: &str, timeout: Duration) -> Result<String> {
+        let mut buf = Vec::new();
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let chunk = read_pipe_ready(&mut self.stdout, Duration::from_millis(200))?;
+            if chunk.is_empty() {
+                continue;
+            }
+            buf.extend_from_slice(&chunk);
+            let text = String::from_utf8_lossy(&buf).to_string();
+            if text.contains(needle) {
+                return Ok(text);
+            }
+        }
+        bail!(
+            "timed out waiting for output containing {needle:?}; current output: {}",
+            String::from_utf8_lossy(&buf)
+        )
+    }
+
+    fn wait_for_exit(&mut self, timeout: Duration) -> Result<std::process::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(status);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        bail!("timed out waiting for process to exit")
     }
 }
 
@@ -299,6 +337,94 @@ fn sandbox_fails_when_cwd_not_granted() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn send_reaches_detached_session() -> Result<()> {
+    let home = TempDir::new()?;
+    let created = run_tmuy(
+        home.path(),
+        &[
+            "new",
+            "echoer",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "while IFS= read -r line; do printf 'E:%s\\n' \"$line\"; [ \"$line\" = quit ] && exit 0; done",
+        ],
+    )?;
+    assert_success(&created);
+
+    let sent = run_tmuy(home.path(), &["send", "echoer", "hello\n"])?;
+    assert_success(&sent);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let tail = run_tmuy(home.path(), &["tail", "echoer"])?;
+    assert_success(&tail);
+    assert!(String::from_utf8_lossy(&tail.stdout).contains("E:hello"));
+
+    let quit = run_tmuy(home.path(), &["send", "echoer", "quit\n"])?;
+    assert_success(&quit);
+    let waited = run_tmuy(home.path(), &["wait", "echoer", "--timeout-secs", "5"])?;
+    assert_success(&waited);
+    Ok(())
+}
+
+#[test]
+fn tail_follow_streams_new_output() -> Result<()> {
+    let home = TempDir::new()?;
+    let created = run_tmuy(
+        home.path(),
+        &[
+            "new",
+            "stream",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "while IFS= read -r line; do printf 'S:%s\\n' \"$line\"; [ \"$line\" = quit ] && exit 0; done",
+        ],
+    )?;
+    assert_success(&created);
+
+    let mut tail = spawn_output_tmuy(home.path(), &["tail", "-f", "stream"])?;
+    let sent = run_tmuy(home.path(), &["send", "stream", "alpha\n"])?;
+    assert_success(&sent);
+    let output = tail.read_until_contains("S:alpha", Duration::from_secs(5))?;
+    assert!(output.contains("S:alpha"));
+
+    let quit = run_tmuy(home.path(), &["send", "stream", "quit\n"])?;
+    assert_success(&quit);
+    let status = tail.wait_for_exit(Duration::from_secs(5))?;
+    assert!(status.success(), "tail -f exit status was {status:?}");
+    Ok(())
+}
+
+#[test]
+fn signal_term_reaches_session_process_group() -> Result<()> {
+    let home = TempDir::new()?;
+    let created = run_tmuy(
+        home.path(),
+        &[
+            "new",
+            "termy",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "trap 'echo term-trapped; exit 43' TERM; while :; do sleep 1; done",
+        ],
+    )?;
+    assert_success(&created);
+
+    std::thread::sleep(Duration::from_millis(500));
+    let signaled = run_tmuy(home.path(), &["signal", "termy", "TERM"])?;
+    assert_success(&signaled);
+
+    let waited = run_tmuy(home.path(), &["wait", "termy", "--timeout-secs", "5"])?;
+    assert_success(&waited);
+    let tailed = run_tmuy(home.path(), &["tail", "termy"])?;
+    assert_success(&tailed);
+    assert!(String::from_utf8_lossy(&tailed.stdout).contains("term-trapped"));
+    Ok(())
+}
+
 fn run_tmuy(home: &std::path::Path, args: &[&str]) -> Result<Output> {
     let output = Command::new(tmuy_bin())
         .args(args)
@@ -338,6 +464,21 @@ fn spawn_attach(home: &std::path::Path, name: &str) -> Result<AttachHarness> {
     Ok(AttachHarness { child, master })
 }
 
+fn spawn_output_tmuy(home: &Path, args: &[&str]) -> Result<OutputHarness> {
+    let mut child = Command::new(tmuy_bin())
+        .args(args)
+        .env("TMUY_HOME", home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("failed to spawn tmuy {:?}", args))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("child stdout was not piped"))?;
+    Ok(OutputHarness { child, stdout })
+}
+
 fn read_ready(master: &mut File, timeout: Duration) -> Result<Vec<u8>> {
     let millis = timeout.as_millis().min(u16::MAX as u128) as u16;
     let mut fds = [PollFd::new(master.as_fd(), PollFlags::POLLIN)];
@@ -353,6 +494,24 @@ fn read_ready(master: &mut File, timeout: Duration) -> Result<Vec<u8>> {
         Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(Vec::new()),
         Err(err) if err.kind() == io::ErrorKind::Interrupted => Ok(Vec::new()),
         Err(err) if err.raw_os_error() == Some(5) => Ok(Vec::new()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn read_pipe_ready(stdout: &mut std::process::ChildStdout, timeout: Duration) -> Result<Vec<u8>> {
+    let millis = timeout.as_millis().min(u16::MAX as u128) as u16;
+    let mut fds = [PollFd::new(stdout.as_fd(), PollFlags::POLLIN)];
+    let ready = poll(&mut fds, PollTimeout::from(millis))?;
+    if ready == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut buf = [0u8; 4096];
+    match stdout.read(&mut buf) {
+        Ok(0) => Ok(Vec::new()),
+        Ok(n) => Ok(buf[..n].to_vec()),
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(Vec::new()),
+        Err(err) if err.kind() == io::ErrorKind::Interrupted => Ok(Vec::new()),
         Err(err) => Err(err.into()),
     }
 }
