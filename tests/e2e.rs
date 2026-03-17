@@ -14,6 +14,20 @@ fn tmuy_bin() -> &'static str {
     env!("CARGO_BIN_EXE_tmuy")
 }
 
+fn linux_bwrap_available() -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+
+    Command::new("bwrap")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 struct AttachHarness {
     child: Child,
     master: File,
@@ -403,6 +417,11 @@ fn kill_sends_ctrl_c_style_interrupt() -> Result<()> {
 
 #[test]
 fn sandbox_ro_denies_write() -> Result<()> {
+    if !linux_bwrap_available() {
+        eprintln!("skipping sandbox_ro_denies_write: bwrap is not installed");
+        return Ok(());
+    }
+
     let home = TempDir::new()?;
     let work = TempDir::new()?;
     std::fs::write(work.path().join("file"), "before")?;
@@ -432,6 +451,11 @@ fn sandbox_ro_denies_write() -> Result<()> {
 
 #[test]
 fn sandbox_rw_allows_write() -> Result<()> {
+    if !linux_bwrap_available() {
+        eprintln!("skipping sandbox_rw_allows_write: bwrap is not installed");
+        return Ok(());
+    }
+
     let home = TempDir::new()?;
     let work = TempDir::new()?;
 
@@ -460,6 +484,11 @@ fn sandbox_rw_allows_write() -> Result<()> {
 
 #[test]
 fn sandbox_net_off_unshares_network_namespace() -> Result<()> {
+    if !linux_bwrap_available() {
+        eprintln!("skipping sandbox_net_off_unshares_network_namespace: bwrap is not installed");
+        return Ok(());
+    }
+
     let home = TempDir::new()?;
     let work = TempDir::new()?;
     let host_ns = std::fs::read_link("/proc/self/ns/net")?

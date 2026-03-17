@@ -37,6 +37,11 @@ jobs:
           restore-keys: |
             cargo-test-${{ runner.os }}-
 
+      - name: Install Linux sandbox dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+
       - name: Format check
         run: cargo fmt --check
 
