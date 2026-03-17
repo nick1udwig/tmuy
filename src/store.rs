@@ -62,6 +62,46 @@ impl Store {
         self.base_dir.join("state.lock")
     }
 
+    fn read_state_file(&self) -> Result<StateFile> {
+        let state_path = self.state_path();
+        if !state_path.exists() {
+            return Ok(StateFile::default());
+        }
+
+        let raw = fs::read(&state_path)?;
+        if raw.is_empty() {
+            Ok(StateFile::default())
+        } else {
+            serde_json::from_slice::<StateFile>(&raw)
+                .with_context(|| format!("failed to parse {}", state_path.display()))
+        }
+    }
+
+    fn write_state_file(&self, state: &StateFile) -> Result<()> {
+        let state_path = self.state_path();
+        let tmp_path = state_path.with_extension("json.tmp");
+        fs::write(&tmp_path, serde_json::to_vec_pretty(state)?)?;
+        fs::rename(tmp_path, &state_path)?;
+        Ok(())
+    }
+
+    fn with_state<T>(&self, mut f: impl FnMut(&StateFile) -> Result<T>) -> Result<T> {
+        fs::create_dir_all(&self.base_dir)?;
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(self.lock_path())?;
+        lock_file.lock_shared()?;
+
+        let state = self.read_state_file()?;
+        let result = f(&state)?;
+
+        lock_file.unlock()?;
+        Ok(result)
+    }
+
     fn with_locked_state<T>(&self, mut f: impl FnMut(&mut StateFile) -> Result<T>) -> Result<T> {
         fs::create_dir_all(&self.base_dir)?;
         let lock_file = OpenOptions::new()
@@ -72,24 +112,11 @@ impl Store {
             .open(self.lock_path())?;
         lock_file.lock_exclusive()?;
 
-        let state_path = self.state_path();
-        let mut state = if state_path.exists() {
-            let raw = fs::read(&state_path)?;
-            if raw.is_empty() {
-                StateFile::default()
-            } else {
-                serde_json::from_slice::<StateFile>(&raw)
-                    .with_context(|| format!("failed to parse {}", state_path.display()))?
-            }
-        } else {
-            StateFile::default()
-        };
+        let mut state = self.read_state_file()?;
 
         let result = f(&mut state)?;
 
-        let tmp_path = state_path.with_extension("json.tmp");
-        fs::write(&tmp_path, serde_json::to_vec_pretty(&state)?)?;
-        fs::rename(tmp_path, &state_path)?;
+        self.write_state_file(&state)?;
         lock_file.unlock()?;
         Ok(result)
     }
@@ -192,7 +219,7 @@ impl Store {
     }
 
     pub fn session_by_hash(&self, hash: &str) -> Result<SessionRecord> {
-        self.with_locked_state(|state| {
+        self.with_state(|state| {
             state
                 .sessions
                 .iter()
@@ -203,11 +230,11 @@ impl Store {
     }
 
     pub fn resolve_target(&self, target: &str, scope: SessionScope) -> Result<SessionRecord> {
-        self.with_locked_state(|state| resolve_target_in_state(state, target, scope))
+        self.with_state(|state| resolve_target_in_state(state, target, scope))
     }
 
     pub fn list_sessions(&self, scope: SessionScope) -> Result<Vec<SessionRecord>> {
-        self.with_locked_state(|state| {
+        self.with_state(|state| {
             let mut sessions: Vec<SessionRecord> = state
                 .sessions
                 .iter()
@@ -492,6 +519,7 @@ fn absolutize_from_cwd(raw_path: &str, cwd: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::os::unix::fs::MetadataExt;
     use std::sync::Mutex;
 
     use tempfile::tempdir;
@@ -635,6 +663,23 @@ mod tests {
         std::fs::write(store.state_path(), b"{invalid").unwrap();
         let err = store.list_sessions(SessionScope::All).unwrap_err();
         assert!(err.to_string().contains("failed to parse"));
+    }
+
+    #[test]
+    fn read_only_lookups_do_not_rewrite_state_file() {
+        let (_tmp, store) = make_store();
+        let created = store.create_session(base_request(Some("alpha"))).unwrap();
+        let before = std::fs::metadata(store.state_path()).unwrap().ino();
+
+        let by_hash = store.session_by_hash(&created.id_hash).unwrap();
+        let by_name = store.resolve_target("alpha", SessionScope::LiveOnly).unwrap();
+        let listed = store.list_sessions(SessionScope::LiveOnly).unwrap();
+
+        let after = std::fs::metadata(store.state_path()).unwrap().ino();
+        assert_eq!(before, after);
+        assert_eq!(by_hash.id_hash, created.id_hash);
+        assert_eq!(by_name.id_hash, created.id_hash);
+        assert_eq!(listed.len(), 1);
     }
 
     #[test]
