@@ -24,6 +24,36 @@ fn ls_human_prints_no_sessions() -> Result<()> {
 }
 
 #[test]
+fn subcommand_help_includes_user_facing_descriptions() -> Result<()> {
+    let home = TempDir::new()?;
+    let cases: [(&[&str], &str); 10] = [
+        (&["new", "--help"], "Create a new session"),
+        (&["attach", "--help"], "Attach to a live session"),
+        (&["kill", "--help"], "Send a Ctrl+C-style interrupt"),
+        (&["ls", "--help"], "List live sessions"),
+        (&["tail", "--help"], "Print or follow terminal output"),
+        (&["inspect", "--help"], "Show full metadata"),
+        (&["send", "--help"], "Send input bytes"),
+        (&["rename", "--help"], "Rename a live session"),
+        (&["wait", "--help"], "Wait for a session to exit"),
+        (&["signal", "--help"], "Send a specific POSIX signal"),
+    ];
+
+    for (args, needle) in cases {
+        let output = run_tmuy(home.path(), args)?;
+        assert_success(&output);
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(needle),
+            "help for {:?} did not contain {:?}\n{}",
+            args,
+            needle,
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn inspect_human_prints_session_detail_lines() -> Result<()> {
     let home = TempDir::new()?;
     let created = run_tmuy(

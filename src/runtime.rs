@@ -13,10 +13,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
-use crossterm::queue;
 use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
-use crossterm::terminal::{Clear, ClearType, size};
+use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, size};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::{execute, queue};
 use nix::sys::signal::{Signal, kill as send_signal};
 use nix::unistd::{Pid, setsid};
 use portable_pty::{PtySize, native_pty_system};
@@ -254,13 +254,14 @@ pub fn attach(store: &Store, name: &str, detach_key: &str) -> Result<()> {
     let mut read_stream = write_stream.try_clone()?;
     let seq = detach_sequence(detach_key)?;
     let mut input_stream = write_stream.try_clone()?;
-    thread::spawn(move || {
-        let _ = attach_input_loop(&mut input_stream, &seq);
-    });
 
     enable_raw_mode()?;
     let _restore = RawModeGuard;
+    let _screen = AlternateScreenGuard::enter()?;
     let status_bar = StatusBarGuard::enter(&session, detach_key)?;
+    thread::spawn(move || {
+        let _ = attach_input_loop(&mut input_stream, &seq);
+    });
     let mut stdout = io::stdout();
     let mut buf = [0u8; 4096];
     status_bar.render(&mut stdout)?;
@@ -645,6 +646,28 @@ struct StatusBarGuard {
     session: SessionRecord,
     detach_key: String,
     rows: Option<u16>,
+}
+
+struct AlternateScreenGuard;
+
+impl AlternateScreenGuard {
+    fn enter() -> Result<Self> {
+        let mut stdout = io::stdout();
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            Clear(ClearType::All),
+            MoveTo(0, 0)
+        )?;
+        Ok(Self)
+    }
+}
+
+impl Drop for AlternateScreenGuard {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, LeaveAlternateScreen, ResetColor);
+    }
 }
 
 impl StatusBarGuard {

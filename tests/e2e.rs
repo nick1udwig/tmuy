@@ -131,6 +131,62 @@ fn attach_detaches_cleanly() -> Result<()> {
 }
 
 #[test]
+fn interactive_new_attaches_by_default_and_uses_custom_detach_key() -> Result<()> {
+    let home = TempDir::new()?;
+
+    let mut session = spawn_pty_process(home.path(), &["new", "demo", "--detach-key", "C-a d"])?;
+    let output = session.read_until_contains("tmuy demo", Duration::from_secs(5))?;
+    assert!(output.contains("detach C-a d"));
+    assert!(output.contains("\u{1b}[?1049h"));
+
+    session.write_all(&[0x01, b'd'])?;
+    let status = session.wait_for_exit(Duration::from_secs(5))?;
+    assert!(status.success(), "new exit status was {status:?}");
+    let transcript = session.read_for(Duration::from_millis(300))?;
+    assert!(transcript.contains("\u{1b}[?1049l"));
+
+    let sent = run_tmuy(home.path(), &["send", "demo", "exit\n"])?;
+    assert_success(&sent);
+    let waited = run_tmuy(home.path(), &["wait", "demo", "--timeout-secs", "5"])?;
+    assert_success(&waited);
+    Ok(())
+}
+
+#[test]
+fn interactive_new_detached_flag_skips_auto_attach() -> Result<()> {
+    let home = TempDir::new()?;
+
+    let mut session = spawn_pty_process(home.path(), &["new", "demo", "--detached"])?;
+    let status = session.wait_for_exit(Duration::from_secs(5))?;
+    assert!(status.success(), "new exit status was {status:?}");
+    let transcript = session.read_for(Duration::from_millis(300))?;
+    assert!(transcript.contains("created demo"));
+    assert!(!transcript.contains("\u{1b}[?1049h"));
+
+    let sent = run_tmuy(home.path(), &["send", "demo", "exit\n"])?;
+    assert_success(&sent);
+    let waited = run_tmuy(home.path(), &["wait", "demo", "--timeout-secs", "5"])?;
+    assert_success(&waited);
+    Ok(())
+}
+
+#[test]
+fn interactive_new_one_shot_stays_detached() -> Result<()> {
+    let home = TempDir::new()?;
+
+    let mut session = spawn_pty_process(
+        home.path(),
+        &["new", "oneshot", "--", "/bin/sh", "-lc", "printf once"],
+    )?;
+    let status = session.wait_for_exit(Duration::from_secs(5))?;
+    assert!(status.success(), "new exit status was {status:?}");
+    let transcript = session.read_for(Duration::from_millis(300))?;
+    assert!(transcript.contains("created oneshot"));
+    assert!(!transcript.contains("\u{1b}[?1049h"));
+    Ok(())
+}
+
+#[test]
 fn attach_ctrl_c_exits_without_broken_pipe() -> Result<()> {
     let home = TempDir::new()?;
     let created = run_tmuy(
@@ -158,6 +214,27 @@ fn attach_ctrl_c_exits_without_broken_pipe() -> Result<()> {
 }
 
 #[test]
+fn attach_uses_session_detach_key_by_default() -> Result<()> {
+    let home = TempDir::new()?;
+    let created = run_tmuy(home.path(), &["new", "custom", "--detach-key", "C-a d"])?;
+    assert_success(&created);
+
+    let mut attach = spawn_attach(home.path(), &["attach", "custom"])?;
+    let output = attach.read_until_contains("detach C-a d", Duration::from_secs(5))?;
+    assert!(output.contains("tmuy custom"));
+
+    attach.write_all(&[0x01, b'd'])?;
+    let status = attach.wait_for_exit(Duration::from_secs(5))?;
+    assert!(status.success(), "attach exit status was {status:?}");
+
+    let sent = run_tmuy(home.path(), &["send", "custom", "exit\n"])?;
+    assert_success(&sent);
+    let waited = run_tmuy(home.path(), &["wait", "custom", "--timeout-secs", "5"])?;
+    assert_success(&waited);
+    Ok(())
+}
+
+#[test]
 fn attach_custom_detach_key_works() -> Result<()> {
     let home = TempDir::new()?;
     let created = run_tmuy(home.path(), &["new", "custom"])?;
@@ -175,6 +252,48 @@ fn attach_custom_detach_key_works() -> Result<()> {
     let sent = run_tmuy(home.path(), &["send", "custom", "exit\n"])?;
     assert_success(&sent);
     let waited = run_tmuy(home.path(), &["wait", "custom", "--timeout-secs", "5"])?;
+    assert_success(&waited);
+    Ok(())
+}
+
+#[test]
+fn attach_rejects_recursive_attach_and_new_auto_attach() -> Result<()> {
+    let home = TempDir::new()?;
+    assert_success(&run_tmuy(home.path(), &["new", "outer"])?);
+    assert_success(&run_tmuy(home.path(), &["new", "other"])?);
+
+    let mut attach = spawn_attach(home.path(), &["attach", "outer"])?;
+    let _ = attach.read_until_contains("tmuy outer", Duration::from_secs(5))?;
+
+    let recursive_attach = format!("{0} attach other; printf 'rc:%s\\n' $? \r", tmuy_bin());
+    attach.write_all(recursive_attach.as_bytes())?;
+    let output = attach.read_until_contains("rc:1", Duration::from_secs(5))?;
+    assert!(output.contains("cannot attach from inside tmuy session"));
+    assert!(output.contains("rc:1"));
+
+    let recursive_new = format!("{0} new nested; printf 'new-rc:%s\\n' $? \r", tmuy_bin());
+    attach.write_all(recursive_new.as_bytes())?;
+    let output = attach.read_until_contains("new-rc:1", Duration::from_secs(5))?;
+    assert!(output.contains("cannot attach from inside tmuy session"));
+
+    let detached_new = format!("{0} new nested --detached\r", tmuy_bin());
+    attach.write_all(detached_new.as_bytes())?;
+    let output = attach.read_until_contains("created nested", Duration::from_secs(5))?;
+    assert!(output.contains("created nested"));
+
+    attach.write_all(b"exit\r")?;
+    let status = attach.wait_for_exit(Duration::from_secs(5))?;
+    assert!(status.success(), "attach exit status was {status:?}");
+
+    let waited = run_tmuy(home.path(), &["wait", "outer", "--timeout-secs", "5"])?;
+    assert_success(&waited);
+    let sent = run_tmuy(home.path(), &["send", "nested", "exit\n"])?;
+    assert_success(&sent);
+    let waited = run_tmuy(home.path(), &["wait", "nested", "--timeout-secs", "5"])?;
+    assert_success(&waited);
+    let sent = run_tmuy(home.path(), &["send", "other", "exit\n"])?;
+    assert_success(&sent);
+    let waited = run_tmuy(home.path(), &["wait", "other", "--timeout-secs", "5"])?;
     assert_success(&waited);
     Ok(())
 }
@@ -534,6 +653,10 @@ fn run_tmuy_in_dir(home: &Path, dir: &Path, args: &[&str]) -> Result<Output> {
 }
 
 fn spawn_attach(home: &std::path::Path, args: &[&str]) -> Result<AttachHarness> {
+    spawn_pty_process(home, args)
+}
+
+fn spawn_pty_process(home: &std::path::Path, args: &[&str]) -> Result<AttachHarness> {
     let pty = openpty(None, None)?;
     let master = File::from(pty.master);
     let slave = File::from(pty.slave);

@@ -141,6 +141,13 @@ impl Store {
             let events_path = log_dir.join("events.jsonl");
             let socket_path = self.live_dir().join(format!("{id_hash}.sock"));
 
+            let mut env = req.env.clone();
+            env.insert("TMUY_SESSION_HASH".to_string(), id_hash.clone());
+            env.insert(
+                "TMUY_SESSION_STARTED_NAME".to_string(),
+                started_name.clone(),
+            );
+
             let record = SessionRecord {
                 id_hash,
                 started_name,
@@ -161,7 +168,7 @@ impl Store {
                 child_pid: None,
                 exit_code: None,
                 failure_reason: None,
-                env: req.env.clone(),
+                env,
                 detach_key: req.detach_key.clone(),
             };
 

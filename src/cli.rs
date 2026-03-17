@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
@@ -16,6 +17,7 @@ use crate::store::{CreateSessionRequest, Store, parse_sandbox, validate_name};
     about = "Terminal multiplexer for one-terminal sessions"
 )]
 struct Cli {
+    /// Emit machine-readable JSON instead of human-oriented text output.
     #[arg(long, global = true, action = ArgAction::SetTrue)]
     json: bool,
 
@@ -25,18 +27,32 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Create a new session. Starts an interactive shell by default.
+    ///
+    /// When run from a terminal, shell sessions attach immediately unless
+    /// `--detached` is passed. One-off commands stay detached and exit when the
+    /// child process exits.
     #[command(alias = "n")]
     New(NewArgs),
+    /// Attach to a live session and stream its terminal output.
     #[command(alias = "a")]
     Attach(AttachArgs),
+    /// Send a Ctrl+C-style interrupt to a live session.
     Kill(KillArgs),
+    /// List live sessions by default, or dead/all sessions with flags.
     #[command(alias = "l", alias = "list")]
     Ls(ListArgs),
+    /// Print or follow terminal output from a session log.
     Tail(TailArgs),
+    /// Show full metadata for a session, including paths and sandbox settings.
     Inspect(NameArgs),
+    /// Send input bytes to a detached or attached live session.
     Send(SendArgs),
+    /// Rename a live session without changing its stable hash.
     Rename(RenameArgs),
+    /// Wait for a session to exit, optionally with a timeout.
     Wait(WaitArgs),
+    /// Send a specific POSIX signal to a live session process group.
     Signal(SignalArgs),
     #[command(hide = true, name = "__serve")]
     Serve(ServeArgs),
@@ -44,83 +60,109 @@ enum Commands {
 
 #[derive(clap::Args, Debug)]
 struct NewArgs {
+    /// Optional session name. If omitted, tmuy uses the next numeric name.
     name: Option<String>,
 
+    /// Filesystem grants for the child process, for example `full`, `ro:.`, or `rw:/tmp`.
     #[arg(long = "fs")]
     fs: Vec<String>,
 
+    /// Network access mode for the child process: `on` or `off`.
     #[arg(long = "net")]
     net: Option<String>,
 
+    /// Detach key sequence used by attached clients for this session.
     #[arg(long, default_value = "C-b d")]
     detach_key: String,
 
+    /// Create the session but do not attach to it, even in an interactive terminal.
+    #[arg(long, action = ArgAction::SetTrue)]
+    detached: bool,
+
+    /// Optional one-off command to run instead of starting an interactive shell.
     #[arg(last = true)]
     command: Vec<String>,
 }
 
 #[derive(clap::Args, Debug)]
 struct AttachArgs {
+    /// Live session name to attach to.
     name: String,
 
-    #[arg(long, default_value = "C-b d")]
-    detach_key: String,
+    /// Override the session's stored detach key for this attach client.
+    #[arg(long)]
+    detach_key: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
 struct KillArgs {
+    /// Live session name to interrupt.
     name: String,
 }
 
 #[derive(clap::Args, Debug)]
 struct ListArgs {
+    /// Show only exited or failed sessions.
     #[arg(long)]
     dead: bool,
 
+    /// Show both live and dead sessions.
     #[arg(long)]
     all: bool,
 }
 
 #[derive(clap::Args, Debug)]
 struct TailArgs {
+    /// Session name to read from.
     name: String,
 
+    /// Emit raw PTY bytes instead of cooked text.
     #[arg(long)]
     raw: bool,
 
+    /// Keep streaming new output until the session exits and the log is drained.
     #[arg(short = 'f', long)]
     follow: bool,
 }
 
 #[derive(clap::Args, Debug)]
 struct NameArgs {
+    /// Session name to inspect.
     name: String,
 }
 
 #[derive(clap::Args, Debug)]
 struct SendArgs {
+    /// Live session name to write to.
     name: String,
 
+    /// Literal payload to send. If omitted, tmuy reads bytes from stdin.
     payload: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
 struct RenameArgs {
+    /// Current live session name.
     name: String,
+    /// New live session name.
     new_name: String,
 }
 
 #[derive(clap::Args, Debug)]
 struct WaitArgs {
+    /// Session name to wait on.
     name: String,
 
+    /// Maximum time to wait before returning an error.
     #[arg(long)]
     timeout_secs: Option<u64>,
 }
 
 #[derive(clap::Args, Debug)]
 struct SignalArgs {
+    /// Live session name to signal.
     name: String,
+    /// Signal name such as `INT`, `TERM`, or `HUP`.
     signal: String,
 }
 
@@ -142,7 +184,10 @@ pub fn run() -> Result<()> {
     match cli.command {
         Commands::New(args) => cmd_new(&store, cli.json, args),
         Commands::Attach(args) => {
-            runtime::attach(&store, &args.name, &args.detach_key)?;
+            ensure_attach_allowed()?;
+            let session = store.resolve_by_name(&args.name, SessionScope::LiveOnly)?;
+            let detach_key = args.detach_key.as_deref().unwrap_or(&session.detach_key);
+            runtime::attach(&store, &args.name, detach_key)?;
             if cli.json {
                 print_json(&BasicOutput {
                     ok: true,
@@ -255,6 +300,10 @@ fn cmd_new(store: &Store, json: bool, args: NewArgs) -> Result<()> {
     } else {
         (CommandMode::OneShot, args.command)
     };
+    let auto_attach = should_auto_attach(json, args.detached, &mode);
+    if auto_attach {
+        ensure_attach_allowed()?;
+    }
 
     let session = store.create_session(CreateSessionRequest {
         explicit_name: args.name,
@@ -268,10 +317,30 @@ fn cmd_new(store: &Store, json: bool, args: NewArgs) -> Result<()> {
     runtime::spawn_daemon(store, &session)?;
     let refreshed = store.session_by_hash(&session.id_hash)?;
 
-    if json {
+    if auto_attach {
+        runtime::attach(store, &refreshed.current_name, &refreshed.detach_key)?;
+    } else if json {
         print_json(&refreshed)?;
     } else {
         println!("created {} ({})", refreshed.current_name, refreshed.id_hash);
+    }
+    Ok(())
+}
+
+fn should_auto_attach(json: bool, detached: bool, mode: &CommandMode) -> bool {
+    !json
+        && !detached
+        && matches!(mode, CommandMode::Shell)
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+}
+
+fn ensure_attach_allowed() -> Result<()> {
+    if let Some(hash) = std::env::var_os("TMUY_SESSION_HASH") {
+        bail!(
+            "cannot attach from inside tmuy session {}; detach first or create the new session with --detached",
+            hash.to_string_lossy()
+        );
     }
     Ok(())
 }
