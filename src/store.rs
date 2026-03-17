@@ -672,7 +672,9 @@ mod tests {
         let before = std::fs::metadata(store.state_path()).unwrap().ino();
 
         let by_hash = store.session_by_hash(&created.id_hash).unwrap();
-        let by_name = store.resolve_target("alpha", SessionScope::LiveOnly).unwrap();
+        let by_name = store
+            .resolve_target("alpha", SessionScope::LiveOnly)
+            .unwrap();
         let listed = store.list_sessions(SessionScope::LiveOnly).unwrap();
 
         let after = std::fs::metadata(store.state_path()).unwrap().ino();

@@ -3,8 +3,8 @@ use std::io::{self, Write};
 use anyhow::Result;
 use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
 use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
-use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, size};
 use crossterm::terminal::disable_raw_mode;
+use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, size};
 use crossterm::{execute, queue};
 
 use crate::model::{FsGrant, SessionRecord};

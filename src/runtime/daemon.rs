@@ -54,7 +54,8 @@ fn spawn_daemon_with_exe(store: &Store, session: &SessionRecord, exe: &Path) -> 
             Err(_) => {}
         }
         if let Some(status) = child.try_wait()? {
-            if let Some(result) = wait_for_ready_state(store, &session.id_hash, Duration::from_secs(1))?
+            if let Some(result) =
+                wait_for_ready_state(store, &session.id_hash, Duration::from_secs(1))?
             {
                 return result;
             }
@@ -65,10 +66,14 @@ fn spawn_daemon_with_exe(store: &Store, session: &SessionRecord, exe: &Path) -> 
         }
         thread::sleep(Duration::from_millis(50));
     }
-    if let Some(result) = wait_for_ready_state(store, &session.id_hash, Duration::from_millis(250))? {
+    if let Some(result) = wait_for_ready_state(store, &session.id_hash, Duration::from_millis(250))?
+    {
         return result;
     }
-    bail!("timed out waiting for session to become ready: {}", session.short_ref())
+    bail!(
+        "timed out waiting for session to become ready: {}",
+        session.short_ref()
+    )
 }
 
 fn wait_for_ready_state(
@@ -148,11 +153,6 @@ mod tests {
 
     fn tmuy_binary() -> PathBuf {
         let current = std::env::current_exe().unwrap();
-        current
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("tmuy")
+        current.parent().unwrap().parent().unwrap().join("tmuy")
     }
 }
