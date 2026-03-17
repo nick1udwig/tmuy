@@ -160,6 +160,7 @@ impl Store {
                 service_pid: None,
                 child_pid: None,
                 exit_code: None,
+                failure_reason: None,
                 env: req.env.clone(),
                 detach_key: req.detach_key.clone(),
             };
@@ -253,6 +254,7 @@ impl Store {
             session.service_pid = Some(service_pid);
             session.child_pid = child_pid;
             session.updated_at = Utc::now();
+            session.failure_reason = None;
         })
     }
 
@@ -262,6 +264,26 @@ impl Store {
             session.exit_code = exit_code;
             session.updated_at = Utc::now();
         })
+    }
+
+    pub fn mark_failed(&self, hash: &str, reason: impl Into<String>) -> Result<SessionRecord> {
+        let reason = reason.into();
+        let failed = self.update_session(hash, |session| {
+            session.status = SessionStatus::Failed;
+            session.failure_reason = Some(reason.clone());
+            session.updated_at = Utc::now();
+        })?;
+        self.append_event(
+            &failed,
+            EventRecord {
+                ts: Utc::now(),
+                kind: "failed".to_string(),
+                detail: serde_json::json!({
+                    "reason": failed.failure_reason,
+                }),
+            },
+        )?;
+        Ok(failed)
     }
 
     pub fn rename_session(&self, current_name: &str, new_name: &str) -> Result<SessionRecord> {

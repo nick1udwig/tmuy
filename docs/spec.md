@@ -80,6 +80,7 @@ Example:
 - `service_pid`
 - `child_pid`
 - `exit_code`
+- `failure_reason`
 - full inherited `env`
 - `detach_key`
 
@@ -95,9 +96,11 @@ Requested interface:
 Behavior:
 
 - Default is full filesystem access plus network on.
-- The current code records sandbox metadata and accepts the flag shape.
-- Non-default sandbox enforcement is not implemented yet.
-- Planned backend: bubblewrap on Linux, Seatbelt-style macOS runner compatible with the Codex model, no Windows support.
+- Linux now enforces non-default sandbox specs with `bubblewrap`.
+- `--fs full --net off` keeps filesystem access but unshares the network namespace.
+- Restricted `ro:/path` and `rw:/path` grants only expose the declared paths plus minimal system directories needed to execute commands.
+- For restricted grants, the session `cwd` must be inside one of the granted paths, otherwise startup fails with a recorded `failure_reason`.
+- Planned backend: Seatbelt-style macOS runner compatible with the Codex model. No Windows support.
 
 ## Attach model
 

@@ -79,6 +79,10 @@ Scenarios:
 - one-off commands exit and appear under `--dead`
 - `kill` and `signal TERM` end the child
 - `tail -f` follows the log until exit
+- `--fs ro:.` blocks writes
+- `--fs rw:.` allows writes
+- `--net off` unshares the network namespace
+- invalid restricted sandboxes fail startup and record `failure_reason`
 
 Notes:
 

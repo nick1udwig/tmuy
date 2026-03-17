@@ -15,9 +15,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use nix::sys::signal::{Signal, kill as send_signal};
 use nix::unistd::{Pid, setsid};
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{PtySize, native_pty_system};
 
 use crate::model::{EventRecord, FsGrant, SessionRecord, SessionScope, SessionStatus};
+use crate::sandbox;
 use crate::store::Store;
 
 type BroadcastMap = Arc<Mutex<HashMap<usize, Sender<Vec<u8>>>>>;
@@ -58,6 +59,12 @@ pub fn spawn_daemon(store: &Store, session: &SessionRecord) -> Result<()> {
             {
                 return Ok(());
             }
+            Ok(updated) if updated.status == SessionStatus::Failed => {
+                let reason = updated
+                    .failure_reason
+                    .unwrap_or_else(|| "session failed to start".to_string());
+                bail!("{reason}");
+            }
             Ok(_) => {}
             Err(_) => {}
         }
@@ -93,7 +100,7 @@ pub fn run_server(store: &Store, hash: &str) -> Result<()> {
         pixel_height: 0,
     })?;
 
-    let builder = build_command(&session)?;
+    let builder = sandbox::build_command(&session)?;
     let mut child = pair.slave.spawn_command(builder)?;
     let child_pid = child.process_id().map(|pid| pid as u32);
     drop(pair.slave);
@@ -316,25 +323,10 @@ pub fn wait_for_exit(
     }
 }
 
-fn build_command(session: &SessionRecord) -> Result<CommandBuilder> {
-    let mut iter = session.command.iter();
-    let program = iter
-        .next()
-        .ok_or_else(|| anyhow!("session has no command configured"))?;
-    let mut builder = CommandBuilder::new(program);
-    for arg in iter {
-        builder.arg(arg);
-    }
-    builder.cwd(&session.cwd);
-    for (key, value) in &session.env {
-        builder.env(key, value);
-    }
-    Ok(builder)
-}
-
 fn sandbox_supported(session: &SessionRecord) -> bool {
     matches!(session.sandbox.fs.as_slice(), [FsGrant::Full])
         && matches!(session.sandbox.net, crate::model::NetworkMode::On)
+        || cfg!(target_os = "linux")
 }
 
 fn broadcast(broadcasters: &BroadcastMap, chunk: &[u8]) {

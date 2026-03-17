@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
+use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -147,12 +148,173 @@ fn kill_sends_ctrl_c_style_interrupt() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn sandbox_ro_denies_write() -> Result<()> {
+    let home = TempDir::new()?;
+    let work = TempDir::new()?;
+    std::fs::write(work.path().join("file"), "before")?;
+
+    let created = run_tmuy_in_dir(
+        home.path(),
+        work.path(),
+        &[
+            "new",
+            "ro",
+            "--fs",
+            "ro:.",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "cat file >/dev/null && (touch new >/dev/null 2>&1; rc=$?; [ $rc -ne 0 ]) && printf ro-ok",
+        ],
+    )?;
+    assert_success(&created);
+
+    let tailed = run_tmuy(home.path(), &["tail", "ro"])?;
+    assert_success(&tailed);
+    assert!(String::from_utf8_lossy(&tailed.stdout).contains("ro-ok"));
+    assert!(!work.path().join("new").exists());
+    Ok(())
+}
+
+#[test]
+fn sandbox_rw_allows_write() -> Result<()> {
+    let home = TempDir::new()?;
+    let work = TempDir::new()?;
+
+    let created = run_tmuy_in_dir(
+        home.path(),
+        work.path(),
+        &[
+            "new",
+            "rw",
+            "--fs",
+            "rw:.",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "touch new && test -f new && printf rw-ok",
+        ],
+    )?;
+    assert_success(&created);
+
+    let tailed = run_tmuy(home.path(), &["tail", "rw"])?;
+    assert_success(&tailed);
+    assert!(String::from_utf8_lossy(&tailed.stdout).contains("rw-ok"));
+    assert!(work.path().join("new").exists());
+    Ok(())
+}
+
+#[test]
+fn sandbox_net_off_unshares_network_namespace() -> Result<()> {
+    let home = TempDir::new()?;
+    let work = TempDir::new()?;
+    let host_ns = std::fs::read_link("/proc/self/ns/net")?
+        .to_string_lossy()
+        .to_string();
+
+    let on = run_tmuy_in_dir(
+        home.path(),
+        work.path(),
+        &[
+            "new",
+            "neton",
+            "--fs",
+            "rw:.",
+            "--net",
+            "on",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "readlink /proc/self/ns/net",
+        ],
+    )?;
+    assert_success(&on);
+    let on_tail = run_tmuy(home.path(), &["tail", "neton"])?;
+    assert_success(&on_tail);
+    let on_ns = String::from_utf8_lossy(&on_tail.stdout).trim().to_string();
+    assert_eq!(on_ns, host_ns);
+
+    let off = run_tmuy_in_dir(
+        home.path(),
+        work.path(),
+        &[
+            "new",
+            "netoff",
+            "--fs",
+            "rw:.",
+            "--net",
+            "off",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "readlink /proc/self/ns/net",
+        ],
+    )?;
+    assert_success(&off);
+    let off_tail = run_tmuy(home.path(), &["tail", "netoff"])?;
+    assert_success(&off_tail);
+    let off_ns = String::from_utf8_lossy(&off_tail.stdout).trim().to_string();
+    assert_ne!(off_ns, host_ns);
+    Ok(())
+}
+
+#[test]
+fn sandbox_fails_when_cwd_not_granted() -> Result<()> {
+    let home = TempDir::new()?;
+    let work = TempDir::new()?;
+    std::fs::create_dir(work.path().join("subdir"))?;
+
+    let output = run_tmuy_in_dir(
+        home.path(),
+        work.path(),
+        &[
+            "new",
+            "bad",
+            "--fs",
+            "ro:subdir",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "printf should-not-run",
+        ],
+    )?;
+    assert!(
+        !output.status.success(),
+        "sandbox startup should have failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let inspect = run_tmuy(home.path(), &["--json", "inspect", "bad"])?;
+    assert_success(&inspect);
+    let inspected: serde_json::Value = serde_json::from_slice(&inspect.stdout)?;
+    assert_eq!(inspected["status"], "Failed");
+    assert!(
+        inspected["failure_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not covered")
+    );
+    Ok(())
+}
+
 fn run_tmuy(home: &std::path::Path, args: &[&str]) -> Result<Output> {
     let output = Command::new(tmuy_bin())
         .args(args)
         .env("TMUY_HOME", home)
         .output()
         .with_context(|| format!("failed to run tmuy {:?}", args))?;
+    Ok(output)
+}
+
+fn run_tmuy_in_dir(home: &Path, dir: &Path, args: &[&str]) -> Result<Output> {
+    let output = Command::new(tmuy_bin())
+        .args(args)
+        .env("TMUY_HOME", home)
+        .current_dir(dir)
+        .output()
+        .with_context(|| format!("failed to run tmuy {:?} in {}", args, dir.display()))?;
     Ok(output)
 }
 

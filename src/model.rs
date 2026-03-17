@@ -78,6 +78,7 @@ pub struct SessionRecord {
     pub service_pid: Option<u32>,
     pub child_pid: Option<u32>,
     pub exit_code: Option<i32>,
+    pub failure_reason: Option<String>,
     pub env: BTreeMap<String, String>,
     pub detach_key: String,
 }

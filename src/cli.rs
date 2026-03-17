@@ -233,7 +233,13 @@ pub fn run() -> Result<()> {
             )?;
             Ok(())
         }
-        Commands::Serve(args) => runtime::run_server(&store, &args.hash),
+        Commands::Serve(args) => match runtime::run_server(&store, &args.hash) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let _ = store.mark_failed(&args.hash, err.to_string());
+                Err(err)
+            }
+        },
     }
 }
 
@@ -315,6 +321,7 @@ fn print_session_detail(session: &SessionRecord) {
     println!("child_pid: {:?}", session.child_pid);
     println!("service_pid: {:?}", session.service_pid);
     println!("exit_code: {:?}", session.exit_code);
+    println!("failure_reason: {:?}", session.failure_reason);
     println!("detach_key: {}", session.detach_key);
 }
 
