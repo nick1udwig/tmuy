@@ -379,51 +379,95 @@ fn resolve_target_in_state(
     target: &str,
     scope: SessionScope,
 ) -> Result<SessionRecord> {
-    let hash_match = state
-        .sessions
-        .iter()
-        .find(|session| session.id_hash == target && session_matches_scope(session, scope))
-        .cloned();
-    let name_match = resolve_name_in_state(state, target, scope);
+    let scoped_sessions = |predicate: &dyn Fn(&SessionRecord) -> bool| {
+        state
+            .sessions
+            .iter()
+            .filter(|session| session_matches_scope(session, scope))
+            .filter(|session| predicate(session))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
 
+    let exact_hash_matches = scoped_sessions(&|session| session.id_hash == target);
+    let exact_name_matches = scoped_sessions(&|session| session.current_name == target);
+    if !exact_hash_matches.is_empty() || !exact_name_matches.is_empty() {
+        return resolve_target_matches(
+            target,
+            resolve_hash_matches(target, &exact_hash_matches, false)?,
+            resolve_name_matches(target, &exact_name_matches, scope, false)?,
+            false,
+        );
+    }
+
+    let prefix_hash_matches = scoped_sessions(&|session| session.id_hash.starts_with(target));
+    let prefix_name_matches = scoped_sessions(&|session| session.current_name.starts_with(target));
+    resolve_target_matches(
+        target,
+        resolve_hash_matches(target, &prefix_hash_matches, true)?,
+        resolve_name_matches(target, &prefix_name_matches, scope, true)?,
+        true,
+    )
+}
+
+fn resolve_target_matches(
+    target: &str,
+    hash_match: Option<SessionRecord>,
+    name_match: Option<SessionRecord>,
+    is_prefix: bool,
+) -> Result<SessionRecord> {
     match (hash_match, name_match) {
-        (Some(hash_session), Ok(name_session)) if hash_session.id_hash != name_session.id_hash => {
+        (Some(hash_session), Some(name_session))
+            if hash_session.id_hash != name_session.id_hash =>
+        {
+            let match_type = if is_prefix { "prefix" } else { "target" };
             bail!(
-                "ambiguous session target: {target}; it matches hash {} and name {}",
+                "ambiguous session {match_type}: {target}; it matches hash {} and name {}",
                 hash_session.short_ref(),
                 name_session.short_ref()
             )
         }
         (Some(hash_session), _) => Ok(hash_session),
-        (None, Ok(name_session)) => Ok(name_session),
-        (None, Err(name_err)) => Err(name_err),
+        (None, Some(name_session)) => Ok(name_session),
+        (None, None) => Err(anyhow!("unknown session target: {target}")),
     }
 }
 
-fn resolve_name_in_state(
-    state: &StateFile,
-    name: &str,
-    scope: SessionScope,
-) -> Result<SessionRecord> {
-    let matches: Vec<SessionRecord> = state
-        .sessions
-        .iter()
-        .filter(|session| session.current_name == name)
-        .filter(|session| session_matches_scope(session, scope))
-        .cloned()
-        .collect();
-
-    match matches.as_slice() {
-        [] => Err(anyhow!("unknown session target: {name}")),
-        [single] => Ok(single.clone()),
+fn resolve_hash_matches(
+    hash: &str,
+    matches: &[SessionRecord],
+    is_prefix: bool,
+) -> Result<Option<SessionRecord>> {
+    match matches {
+        [] => Ok(None),
+        [single] => Ok(Some(single.clone())),
         _ => {
-            if scope == SessionScope::All {
+            let match_type = if is_prefix { "prefix" } else { "hash" };
+            Err(anyhow!(
+                "ambiguous session {match_type}: {hash}; use a unique current name or stable session hash"
+            ))
+        }
+    }
+}
+
+fn resolve_name_matches(
+    name: &str,
+    matches: &[SessionRecord],
+    scope: SessionScope,
+    is_prefix: bool,
+) -> Result<Option<SessionRecord>> {
+    match matches {
+        [] => Ok(None),
+        [single] => Ok(Some(single.clone())),
+        _ => {
+            if !is_prefix && scope == SessionScope::All {
                 if let Some(live) = matches.iter().find(|session| session.status.is_live()) {
-                    return Ok(live.clone());
+                    return Ok(Some(live.clone()));
                 }
             }
+            let match_type = if is_prefix { "prefix" } else { "target" };
             Err(anyhow!(
-                "ambiguous session target: {name}; use a unique current name or the stable session hash"
+                "ambiguous session {match_type}: {name}; use a unique current name or stable session hash"
             ))
         }
     }
@@ -705,6 +749,35 @@ mod tests {
 
         assert_eq!(by_name.id_hash, created.id_hash);
         assert_eq!(by_hash.id_hash, created.id_hash);
+    }
+
+    #[test]
+    fn resolve_target_accepts_unique_name_and_hash_prefixes() {
+        let (_tmp, store) = make_store();
+        let created = store.create_session(base_request(Some("foobar"))).unwrap();
+
+        let by_name_prefix = store.resolve_target("foo", SessionScope::LiveOnly).unwrap();
+        let by_hash_prefix = store
+            .resolve_target(&created.id_hash[..4], SessionScope::LiveOnly)
+            .unwrap();
+
+        assert_eq!(by_name_prefix.id_hash, created.id_hash);
+        assert_eq!(by_hash_prefix.id_hash, created.id_hash);
+    }
+
+    #[test]
+    fn resolve_target_errors_for_ambiguous_prefixes() {
+        let (_tmp, store) = make_store();
+        store.create_session(base_request(Some("foobar"))).unwrap();
+        store.create_session(base_request(Some("fabar"))).unwrap();
+
+        let err = store.resolve_target("fa", SessionScope::LiveOnly).unwrap();
+        assert_eq!(err.current_name, "fabar");
+
+        let err = store
+            .resolve_target("f", SessionScope::LiveOnly)
+            .unwrap_err();
+        assert!(err.to_string().contains("ambiguous session prefix"));
     }
 
     #[test]

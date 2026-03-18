@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use crossterm::terminal::enable_raw_mode;
+use crossterm::terminal::{enable_raw_mode, size};
 
 use crate::model::{EventRecord, SessionScope};
 use crate::store::Store;
@@ -20,7 +20,8 @@ pub fn attach(store: &Store, name: &str, detach_key: &str) -> Result<()> {
     let stream = UnixStream::connect(&session.socket_path)
         .with_context(|| format!("failed to connect to {}", session.socket_path.display()))?;
     let mut write_stream = stream;
-    write_stream.write_all(b"A")?;
+    let (cols, rows) = size().unwrap_or((80, 24));
+    write_stream.write_all(&attach_handshake_payload(rows, cols))?;
     write_stream.flush()?;
     let mut read_stream = write_stream.try_clone()?;
     let seq = detach_sequence(detach_key)?;
@@ -50,6 +51,15 @@ pub fn attach(store: &Store, name: &str, detach_key: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn attach_handshake_payload(rows: u16, cols: u16) -> [u8; 5] {
+    let usable_rows = rows.saturating_sub(1).max(1);
+    let mut payload = [0u8; 5];
+    payload[0] = b'A';
+    payload[1..3].copy_from_slice(&usable_rows.to_be_bytes());
+    payload[3..5].copy_from_slice(&cols.max(1).to_be_bytes());
+    payload
 }
 
 pub fn send_input(store: &Store, name: &str, bytes: &[u8]) -> Result<()> {
@@ -137,5 +147,16 @@ pub fn wait_for_exit(
             }
         }
         thread::sleep(Duration::from_millis(200));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::attach_handshake_payload;
+
+    #[test]
+    fn attach_handshake_uses_usable_rows_and_cols() {
+        assert_eq!(attach_handshake_payload(8, 40), [b'A', 0, 7, 0, 40]);
+        assert_eq!(attach_handshake_payload(1, 0), [b'A', 0, 1, 0, 1]);
     }
 }
