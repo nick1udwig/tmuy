@@ -18,3 +18,4 @@ serde_json = "1.0.145"
 
 [dev-dependencies]
 tempfile = "3.23.0"
+vt100 = "0.16.2"

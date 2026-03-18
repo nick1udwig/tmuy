@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-use nix::pty::openpty;
+use nix::pty::{Winsize, openpty};
 use tempfile::TempDir;
+use vt100::Parser;
 
 fn tmuy_bin() -> &'static str {
     env!("CARGO_BIN_EXE_tmuy")
@@ -458,6 +459,56 @@ fn attach_shows_status_bar_immediately_for_quiet_sessions() -> Result<()> {
 }
 
 #[test]
+fn attach_preserves_reverse_search_screen_for_long_history_entries() -> Result<()> {
+    let home = TempDir::new()?;
+    let created = run_tmuy(
+        home.path(),
+        &[
+            "new",
+            "searchy",
+            "--",
+            "/usr/bin/env",
+            "PS1=$ ",
+            "TERM=xterm-256color",
+            "/bin/bash",
+            "--norc",
+            "--noprofile",
+            "-i",
+        ],
+    )?;
+    assert_success(&created);
+
+    let long_command = format!("echo TOKEN_{}", "x".repeat(120));
+    let sent = run_tmuy(home.path(), &["send", "searchy", &long_command])?;
+    assert_success(&sent);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut attach = spawn_pty_process_with_size(home.path(), &["attach", "searchy"], 8, 40)?;
+    let mut transcript = attach.read_until_contains("tmuy searchy", Duration::from_secs(5))?;
+    attach.write_all(b"\x12TOKEN_")?;
+    transcript.push_str(&attach.read_for(Duration::from_millis(800))?);
+
+    let screen = parse_screen(&transcript, 8, 40);
+    assert!(
+        screen.contains("(reverse-i-search)`TOKEN_'"),
+        "reverse search prompt missing from screen:\n{screen}\n\nraw:\n{transcript:?}"
+    );
+    assert!(
+        screen.contains("echo TOKEN_"),
+        "matched command missing from screen:\n{screen}\n\nraw:\n{transcript:?}"
+    );
+    assert!(
+        !screen.contains("$ echo TOKEN_"),
+        "shell prompt leaked into active reverse-search line:\n{screen}\n\nraw:\n{transcript:?}"
+    );
+
+    attach.write_all(&[0x02, b'd'])?;
+    let status = attach.wait_for_exit(Duration::from_secs(5))?;
+    assert!(status.success(), "attach exit status was {status:?}");
+    Ok(())
+}
+
+#[test]
 fn kill_sends_ctrl_c_style_interrupt() -> Result<()> {
     let home = TempDir::new()?;
     let created = run_tmuy(
@@ -874,7 +925,22 @@ fn spawn_attach(home: &std::path::Path, args: &[&str]) -> Result<AttachHarness> 
 }
 
 fn spawn_pty_process(home: &std::path::Path, args: &[&str]) -> Result<AttachHarness> {
-    let pty = openpty(None, None)?;
+    spawn_pty_process_with_size(home, args, 24, 80)
+}
+
+fn spawn_pty_process_with_size(
+    home: &std::path::Path,
+    args: &[&str],
+    rows: u16,
+    cols: u16,
+) -> Result<AttachHarness> {
+    let winsize = Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let pty = openpty(Some(&winsize), None)?;
     let master = File::from(pty.master);
     let slave = File::from(pty.slave);
     let stdin = Stdio::from(slave.try_clone()?);
@@ -891,6 +957,12 @@ fn spawn_pty_process(home: &std::path::Path, args: &[&str]) -> Result<AttachHarn
         .with_context(|| format!("failed to spawn attach for {:?}", args))?;
 
     Ok(AttachHarness { child, master })
+}
+
+fn parse_screen(transcript: &str, rows: u16, cols: u16) -> String {
+    let mut parser = Parser::new(rows, cols, 0);
+    parser.process(transcript.as_bytes());
+    parser.screen().contents()
 }
 
 fn spawn_output_tmuy(home: &Path, args: &[&str]) -> Result<OutputHarness> {
