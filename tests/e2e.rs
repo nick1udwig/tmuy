@@ -387,6 +387,46 @@ fn attach_replays_existing_output() -> Result<()> {
 }
 
 #[test]
+fn attach_accepts_unique_name_prefixes_and_rejects_ambiguous_ones() -> Result<()> {
+    let home = TempDir::new()?;
+    assert_success(&run_tmuy(home.path(), &["new", "foobar"])?);
+    assert_success(&run_tmuy(home.path(), &["new", "fabar"])?);
+
+    let ambiguous = run_tmuy(home.path(), &["attach", "f"])?;
+    assert!(
+        !ambiguous.status.success(),
+        "attach unexpectedly succeeded: stdout={} stderr={}",
+        String::from_utf8_lossy(&ambiguous.stdout),
+        String::from_utf8_lossy(&ambiguous.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&ambiguous.stderr).contains("ambiguous session prefix"),
+        "unexpected attach stderr: {}",
+        String::from_utf8_lossy(&ambiguous.stderr)
+    );
+
+    let mut attach = spawn_attach(home.path(), &["attach", "fo"])?;
+    let output = attach.read_until_contains("tmuy foobar", Duration::from_secs(5))?;
+    assert!(output.contains("tmuy foobar"));
+
+    attach.write_all(&[0x02, b'd'])?;
+    let status = attach.wait_for_exit(Duration::from_secs(5))?;
+    assert!(status.success(), "attach exit status was {status:?}");
+
+    assert_success(&run_tmuy(home.path(), &["send", "foobar", "exit\n"])?);
+    assert_success(&run_tmuy(
+        home.path(),
+        &["wait", "foobar", "--timeout-secs", "5"],
+    )?);
+    assert_success(&run_tmuy(home.path(), &["send", "fabar", "exit\n"])?);
+    assert_success(&run_tmuy(
+        home.path(),
+        &["wait", "fabar", "--timeout-secs", "5"],
+    )?);
+    Ok(())
+}
+
+#[test]
 fn attach_shows_status_bar_immediately_for_quiet_sessions() -> Result<()> {
     let home = TempDir::new()?;
     let created = run_tmuy(
