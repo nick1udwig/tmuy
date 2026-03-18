@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, bail};
 use nix::sys::signal::{Signal, kill as send_signal};
 use nix::unistd::Pid;
-use portable_pty::{PtySize, native_pty_system};
+use portable_pty::{MasterPty, PtySize, native_pty_system};
 
 use crate::model::{EventRecord, FsGrant, SessionRecord};
 use crate::sandbox;
@@ -104,8 +104,15 @@ pub fn run_server(store: &Store, hash: &str) -> Result<()> {
     let listener = UnixListener::bind(&session.socket_path)?;
     listener.set_nonblocking(true)?;
 
-    let mut reader = pair.master.try_clone_reader()?;
-    let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
+    let master = Arc::new(Mutex::new(pair.master));
+    let mut reader = {
+        let master = master.lock().expect("pty master poisoned");
+        master.try_clone_reader()?
+    };
+    let writer = Arc::new(Mutex::new({
+        let master = master.lock().expect("pty master poisoned");
+        master.take_writer()?
+    }));
     let running = Arc::new(AtomicBool::new(true));
     let output_state: SharedOutputState = Arc::new(Mutex::new(OutputState::new()));
     let next_client_id = Arc::new(AtomicUsize::new(1));
@@ -187,6 +194,7 @@ pub fn run_server(store: &Store, hash: &str) -> Result<()> {
         match listener.accept() {
             Ok((stream, _)) => {
                 let server_state = ServerState {
+                    master: master.clone(),
                     writer: writer.clone(),
                     output_state: output_state.clone(),
                     next_client_id: next_client_id.clone(),
@@ -251,6 +259,7 @@ fn broadcast(output_state: &SharedOutputState, chunk: &[u8]) {
 }
 
 struct ServerState {
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     output_state: SharedOutputState,
     next_client_id: Arc<AtomicUsize>,
@@ -261,7 +270,10 @@ fn handle_client(mut stream: UnixStream, state: ServerState) -> Result<()> {
     let mut mode = [0u8; 1];
     stream.read_exact(&mut mode)?;
     match mode[0] {
-        b'A' => handle_attach_client(stream, state),
+        b'A' => {
+            let size = read_attach_size(&mut stream)?;
+            handle_attach_client(stream, state, size)
+        }
         b'I' => {
             let mut input = Vec::new();
             stream.read_to_end(&mut input)?;
@@ -283,7 +295,24 @@ fn handle_client(mut stream: UnixStream, state: ServerState) -> Result<()> {
     }
 }
 
-fn handle_attach_client(mut stream: UnixStream, state: ServerState) -> Result<()> {
+fn read_attach_size(stream: &mut UnixStream) -> Result<PtySize> {
+    let mut payload = [0u8; 4];
+    stream.read_exact(&mut payload)?;
+    let rows = u16::from_be_bytes([payload[0], payload[1]]).max(1);
+    let cols = u16::from_be_bytes([payload[2], payload[3]]).max(1);
+    Ok(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    })
+}
+
+fn handle_attach_client(mut stream: UnixStream, state: ServerState, size: PtySize) -> Result<()> {
+    {
+        let master = state.master.lock().expect("pty master poisoned");
+        master.resize(size)?;
+    }
     let client_id = state.next_client_id.fetch_add(1, Ordering::SeqCst);
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let mut write_stream = stream.try_clone()?;
@@ -360,6 +389,19 @@ mod tests {
     use crate::model::{CommandMode, SandboxSpec, SessionStatus};
     use crate::store::{CreateSessionRequest, Store};
 
+    fn test_master() -> Arc<Mutex<Box<dyn MasterPty + Send>>> {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        drop(pair.slave);
+        Arc::new(Mutex::new(pair.master))
+    }
+
     fn make_store_and_session(command: Vec<String>) -> (tempfile::TempDir, Store, SessionRecord) {
         let tmp = tempdir().unwrap();
         let store = Store::from_base_dir(tmp.path().join(".tmuy")).unwrap();
@@ -411,6 +453,7 @@ mod tests {
         handle_client(
             server,
             ServerState {
+                master: test_master(),
                 writer,
                 output_state: output_state.clone(),
                 next_client_id: Arc::new(AtomicUsize::new(1)),
@@ -429,6 +472,7 @@ mod tests {
         handle_client(
             server,
             ServerState {
+                master: test_master(),
                 writer,
                 output_state,
                 next_client_id: Arc::new(AtomicUsize::new(1)),
@@ -446,6 +490,7 @@ mod tests {
         let err = handle_client(
             server,
             ServerState {
+                master: test_master(),
                 writer,
                 output_state: Arc::new(Mutex::new(OutputState::new())),
                 next_client_id: Arc::new(AtomicUsize::new(1)),
@@ -473,6 +518,7 @@ mod tests {
         handle_client(
             server,
             ServerState {
+                master: test_master(),
                 writer,
                 output_state: Arc::new(Mutex::new(OutputState::new())),
                 next_client_id: Arc::new(AtomicUsize::new(1)),
@@ -493,12 +539,24 @@ mod tests {
         ));
         let (client, server) = UnixStream::pair().unwrap();
         let state = ServerState {
+            master: test_master(),
             writer,
             output_state: output_state.clone(),
             next_client_id: Arc::new(AtomicUsize::new(1)),
             child_pid: None,
         };
-        let handle = thread::spawn(move || handle_attach_client(server, state));
+        let handle = thread::spawn(move || {
+            handle_attach_client(
+                server,
+                state,
+                PtySize {
+                    rows: 23,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            )
+        });
 
         let deadline = Instant::now() + Duration::from_secs(1);
         while Instant::now() < deadline {
@@ -514,6 +572,16 @@ mod tests {
         let _ = client.shutdown(std::net::Shutdown::Write);
 
         assert!(handle.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn read_attach_size_parses_rows_and_cols() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.write_all(&[0, 7, 0, 40]).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let size = read_attach_size(&mut server).unwrap();
+        assert_eq!(size.rows, 7);
+        assert_eq!(size.cols, 40);
     }
 
     #[test]
