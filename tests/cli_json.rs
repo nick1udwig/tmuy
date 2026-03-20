@@ -312,6 +312,54 @@ fn json_automation_flow_prefers_stable_hash_and_raw_bytes() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn events_jsonl_follow_reports_session_lifecycle() -> Result<()> {
+    let home = TempDir::new()?;
+
+    let created = run_tmuy(
+        home.path(),
+        &[
+            "--json",
+            "new",
+            "events",
+            "--detached",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "trap 'exit 0' TERM; while :; do sleep 1; done",
+        ],
+    )?;
+    assert_success(&created);
+    let created_json: Value = serde_json::from_slice(&created.stdout)?;
+    let hash = created_json["id_hash"]
+        .as_str()
+        .context("missing events id_hash")?
+        .to_string();
+
+    let events = spawn_tmuy(home.path(), &["events", &hash, "--jsonl", "--follow"])?;
+
+    let signaled = run_tmuy(home.path(), &["--json", "signal", &hash, "TERM"])?;
+    assert_success(&signaled);
+
+    let output = events.wait_with_output()?;
+    assert_success(&output);
+
+    let kinds = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter_map(|line| line["kind"].as_str().map(ToOwned::to_owned))
+        .collect::<Vec<_>>();
+
+    assert!(kinds.iter().any(|kind| kind == "created"));
+    assert!(kinds.iter().any(|kind| kind == "live"));
+    assert!(kinds.iter().any(|kind| kind == "signal"));
+    assert!(kinds.iter().any(|kind| kind == "exited"));
+
+    Ok(())
+}
+
 fn run_tmuy(home: &Path, args: &[&str]) -> Result<Output> {
     let output = Command::new(tmuy_bin())
         .args(args)
@@ -348,6 +396,17 @@ fn run_tmuy_with_stdin(home: &Path, args: &[&str], stdin_bytes: &[u8]) -> Result
         .write_all(stdin_bytes)?;
     let output = child.wait_with_output()?;
     Ok(output)
+}
+
+fn spawn_tmuy(home: &Path, args: &[&str]) -> Result<std::process::Child> {
+    let child = Command::new(tmuy_bin())
+        .args(args)
+        .env("TMUY_HOME", home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn tmuy {:?}", args))?;
+    Ok(child)
 }
 
 fn wait_for_tail_contains(

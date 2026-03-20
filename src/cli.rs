@@ -44,6 +44,8 @@ enum Commands {
     Ls(ListArgs),
     /// Print or follow terminal output from a session log.
     Tail(TailArgs),
+    /// Print or follow session events from the official event stream.
+    Events(EventsArgs),
     /// Show full metadata for a session, including paths and sandbox settings.
     Inspect(NameArgs),
     /// Send input to a detached or attached live session, pressing Enter by default.
@@ -121,6 +123,20 @@ struct TailArgs {
     raw: bool,
 
     /// Keep streaming new output until the session exits and the log is drained.
+    #[arg(short = 'f', long)]
+    follow: bool,
+}
+
+#[derive(clap::Args, Debug)]
+struct EventsArgs {
+    /// Session name or hash to read events from.
+    name: String,
+
+    /// Emit newline-delimited JSON event records.
+    #[arg(long, action = ArgAction::SetTrue)]
+    jsonl: bool,
+
+    /// Keep streaming new events until the session exits and events are drained.
     #[arg(short = 'f', long)]
     follow: bool,
 }
@@ -214,6 +230,7 @@ pub fn run() -> Result<()> {
         }
         Commands::Ls(args) => cmd_ls(&store, cli.json, args),
         Commands::Tail(args) => runtime::tail(&store, &args.name, args.raw, args.follow),
+        Commands::Events(args) => runtime::events(&store, &args.name, args.jsonl, args.follow),
         Commands::Inspect(args) => {
             let session = store.resolve_target(&args.name, SessionScope::All)?;
             if cli.json {

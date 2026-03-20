@@ -16,6 +16,7 @@ Use these commands for automation:
 - `tmuy --json wait <name-or-hash> [--timeout-secs N]`
 - `tmuy --json signal <name-or-hash> <INT|TERM|KILL|HUP>`
 - `tmuy --json kill <name-or-hash>`
+- `tmuy events <name-or-hash> --jsonl [--follow]`
 
 For output bytes, use:
 
@@ -36,7 +37,8 @@ Session names can change after `rename`, but `id_hash` does not.
 3. Read state with `inspect --json` or `ls --json`.
 4. Write input with `send` and use `--no-enter` when exact bytes matter.
 5. Read output with `tail --raw --follow`.
-6. Wait for completion with `wait --json`.
+6. Follow lifecycle changes with `events --jsonl --follow`.
+7. Wait for completion with `wait --json`.
 
 ## Non-Public Internals
 
