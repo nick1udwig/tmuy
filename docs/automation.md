@@ -30,6 +30,9 @@ For exact input bytes, use:
 Programs should prefer the stable `id_hash` returned by `new --json` or `inspect --json`.
 Session names can change after `rename`, but `id_hash` does not.
 
+For richer integrations, `tmuy rpc serve` exposes a versioned local socket API.
+See [`rpc-v1.md`](rpc-v1.md).
+
 ## Recommended Flow
 
 1. Create a detached session with `new --json`.

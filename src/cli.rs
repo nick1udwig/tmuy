@@ -7,6 +7,7 @@ use clap::{ArgAction, Parser, Subcommand};
 use serde::Serialize;
 
 use crate::model::{CommandMode, SessionRecord, SessionScope};
+use crate::rpc;
 use crate::runtime;
 use crate::store::{CreateSessionRequest, Store, parse_sandbox, validate_name};
 
@@ -56,6 +57,8 @@ enum Commands {
     Wait(WaitArgs),
     /// Send a specific POSIX signal to a live session process group.
     Signal(SignalArgs),
+    /// Serve the versioned local RPC API over a Unix socket.
+    Rpc(RpcArgs),
     #[command(hide = true, name = "__serve")]
     Serve(ServeArgs),
 }
@@ -187,6 +190,25 @@ struct SignalArgs {
 }
 
 #[derive(clap::Args, Debug)]
+struct RpcArgs {
+    #[command(subcommand)]
+    command: RpcCommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum RpcCommands {
+    /// Listen for versioned RPC requests on a Unix socket.
+    Serve(RpcServeArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct RpcServeArgs {
+    /// Override the default RPC socket path.
+    #[arg(long)]
+    socket: Option<std::path::PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
 struct ServeArgs {
     hash: String,
 }
@@ -300,6 +322,9 @@ pub fn run() -> Result<()> {
             )?;
             Ok(())
         }
+        Commands::Rpc(args) => match args.command {
+            RpcCommands::Serve(args) => rpc::run_rpc_server(&store, args.socket),
+        },
         Commands::Serve(args) => match runtime::run_server(&store, &args.hash) {
             Ok(()) => Ok(()),
             Err(err) => {

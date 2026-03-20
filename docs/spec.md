@@ -16,6 +16,7 @@
 - `tmuy rename <name> <new-name>`
 - `tmuy wait <name> [--timeout-secs N]`
 - `tmuy signal <name> <INT|TERM|KILL|HUP>`
+- `tmuy rpc serve [--socket PATH]`
 - Global: `--json`
 
 ## Automation API
@@ -29,12 +30,14 @@ CLI plus `--json`.
 - write input with `send`, using `--no-enter` for exact bytes
 - read output with `tail --raw` or `tail --raw --follow`
 - follow lifecycle events with `events --jsonl --follow`
+- use `rpc serve` for a versioned local control socket
 - wait for exit with `wait --json`
 
 The hidden `__serve` subcommand, per-session socket protocol, and direct writes
 to files under `~/.tmuy` are not public APIs.
 
 See [`docs/automation.md`](automation.md) for the canonical automation flow.
+See [`docs/rpc-v1.md`](rpc-v1.md) for the local RPC protocol.
 
 ## Core rules
 
