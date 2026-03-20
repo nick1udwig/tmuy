@@ -228,8 +228,44 @@ pub fn wait_for_exit(
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_handshake_payload, flush_event_lines_to};
-    use crate::model::EventRecord;
+    use std::collections::BTreeMap;
+    use std::io::Read;
+    use std::os::unix::{net::UnixListener, process::CommandExt};
+    use std::process::Command;
+    use std::time::Duration;
+
+    use nix::unistd::setsid;
+    use tempfile::tempdir;
+
+    use super::{
+        attach_handshake_payload, emit_event_line, flush_event_lines_to, send_input,
+        signal_session, wait_for_exit,
+    };
+    use crate::model::{CommandMode, EventRecord, SandboxSpec, SessionStatus};
+    use crate::store::{CreateSessionRequest, Store};
+
+    fn make_store_and_session(
+        name: &str,
+    ) -> (tempfile::TempDir, Store, crate::model::SessionRecord) {
+        let tmp = tempdir().unwrap();
+        let store = Store::from_base_dir(tmp.path().join(".tmuy")).unwrap();
+        let session = store
+            .create_session(CreateSessionRequest {
+                explicit_name: Some(name.to_string()),
+                cwd: tmp.path().to_path_buf(),
+                command: vec![
+                    "/bin/sh".to_string(),
+                    "-lc".to_string(),
+                    "printf ok".to_string(),
+                ],
+                mode: CommandMode::OneShot,
+                sandbox: SandboxSpec::default(),
+                detach_key: "C-b d".to_string(),
+                env: BTreeMap::new(),
+            })
+            .unwrap();
+        (tmp, store, session)
+    }
 
     #[test]
     fn attach_handshake_uses_usable_rows_and_cols() {
@@ -257,5 +293,90 @@ mod tests {
         flush_event_lines_to(&mut pending, true, &mut output).unwrap();
         assert!(pending.is_empty());
         assert_eq!(output, [line, b"\n".to_vec()].concat());
+    }
+
+    #[test]
+    fn emit_event_line_formats_human_output_and_skips_blank_lines() {
+        let event = EventRecord {
+            ts: chrono::Utc::now(),
+            kind: "created".to_string(),
+            detail: serde_json::json!({"name": "demo"}),
+        };
+        let line = serde_json::to_vec(&event).unwrap();
+        let mut output = Vec::new();
+        emit_event_line(&mut output, &line, false).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("\tcreated\t"));
+        assert!(text.contains("\"name\":\"demo\""));
+
+        let mut blank = Vec::new();
+        emit_event_line(&mut blank, b"", false).unwrap();
+        assert!(blank.is_empty());
+    }
+
+    #[test]
+    fn send_input_writes_mode_byte_and_payload() {
+        let (_tmp, store, session) = make_store_and_session("writer");
+        let listener = UnixListener::bind(&session.socket_path).unwrap();
+        store
+            .mark_live(&session.id_hash, std::process::id(), None)
+            .unwrap();
+
+        send_input(&store, &session.id_hash, b"hello\n").unwrap();
+
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut data = Vec::new();
+        stream.read_to_end(&mut data).unwrap();
+        assert_eq!(data, b"Ihello\n");
+    }
+
+    #[test]
+    fn signal_session_records_event_and_rejects_missing_child_pid() {
+        let (_tmp, store, session) = make_store_and_session("missing-pid");
+        store
+            .mark_live(&session.id_hash, std::process::id(), None)
+            .unwrap();
+        let err = signal_session(&store, &session.id_hash, "TERM").unwrap_err();
+        assert!(err.to_string().contains("session has no child pid yet"));
+
+        let (_tmp, store, session) = make_store_and_session("signaled");
+        let mut child = Command::new("/bin/sh");
+        child.args(["-lc", "trap 'exit 0' TERM; while :; do sleep 1; done"]);
+        // SAFETY: setsid is called in the child just before exec to isolate its process group.
+        unsafe {
+            child.pre_exec(|| {
+                setsid().map_err(std::io::Error::other)?;
+                Ok(())
+            });
+        }
+        let mut child = child.spawn().unwrap();
+        store
+            .mark_live(&session.id_hash, std::process::id(), Some(child.id()))
+            .unwrap();
+
+        signal_session(&store, &session.id_hash, "TERM").unwrap();
+        child.wait().unwrap();
+        let events = std::fs::read_to_string(session.events_path).unwrap();
+        assert!(events.contains("\"kind\":\"signal\""));
+    }
+
+    #[test]
+    fn wait_for_exit_returns_dead_sessions_and_times_out_for_live_ones() {
+        let (_tmp, store, session) = make_store_and_session("done");
+        store.mark_exited(&session.id_hash, Some(7)).unwrap();
+        let waited = wait_for_exit(&store, &session.id_hash, Some(Duration::from_secs(1))).unwrap();
+        assert_eq!(waited.status, SessionStatus::Exited);
+        assert_eq!(waited.exit_code, Some(7));
+
+        let (_tmp, store, session) = make_store_and_session("live");
+        store
+            .mark_live(&session.id_hash, std::process::id(), None)
+            .unwrap();
+        let err =
+            wait_for_exit(&store, &session.id_hash, Some(Duration::from_millis(1))).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("timed out waiting for session to exit")
+        );
     }
 }
