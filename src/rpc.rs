@@ -11,7 +11,7 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::model::{CommandMode, EventRecord, SessionScope};
+use crate::model::{CommandMode, EventRecord, SessionRecord, SessionScope};
 use crate::runtime;
 use crate::store::{CreateSessionRequest, Store, parse_sandbox, validate_name};
 
@@ -99,7 +99,24 @@ pub fn run_rpc_server(store: &Store, socket_path: Option<PathBuf>) -> Result<()>
 }
 
 fn handle_connection(store: &Store, stream: &mut UnixStream) -> Result<()> {
-    match read_request(stream)? {
+    handle_connection_with_spawn(store, stream, runtime::spawn_daemon)
+}
+
+fn handle_connection_with_spawn(
+    store: &Store,
+    stream: &mut UnixStream,
+    spawn_daemon: impl Fn(&Store, &SessionRecord) -> Result<()>,
+) -> Result<()> {
+    dispatch_request(store, stream, read_request(stream)?, spawn_daemon)
+}
+
+fn dispatch_request(
+    store: &Store,
+    stream: &mut UnixStream,
+    request: RpcRequest,
+    spawn_daemon: impl Fn(&Store, &SessionRecord) -> Result<()>,
+) -> Result<()> {
+    match request {
         RpcRequest::Ping => write_result(stream, json!({ "version": RPC_VERSION })),
         RpcRequest::Create {
             name,
@@ -134,7 +151,7 @@ fn handle_connection(store: &Store, stream: &mut UnixStream) -> Result<()> {
                 detach_key,
                 env,
             })?;
-            runtime::spawn_daemon(store, &session)?;
+            spawn_daemon(store, &session)?;
             write_result(stream, store.session_by_hash(&session.id_hash)?)
         }
         RpcRequest::List { dead, all } => {
@@ -344,7 +361,67 @@ fn write_line(stream: &mut UnixStream, value: &serde_json::Value) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::io::Read;
+    use std::net::Shutdown;
+    use std::os::unix::process::CommandExt;
+    use std::path::Path;
+    use std::process::Command;
+
+    use nix::unistd::setsid;
+    use serde_json::Value;
+    use tempfile::{TempDir, tempdir};
+
     use super::*;
+    use crate::model::{CommandMode, SandboxSpec, SessionStatus};
+    use crate::store::CreateSessionRequest;
+
+    fn make_store() -> (TempDir, Store) {
+        let tmp = tempdir().unwrap();
+        let store = Store::from_base_dir(tmp.path().join(".tmuy")).unwrap();
+        (tmp, store)
+    }
+
+    fn create_session(store: &Store, cwd: &Path, name: &str) -> SessionRecord {
+        store
+            .create_session(CreateSessionRequest {
+                explicit_name: Some(name.to_string()),
+                cwd: cwd.to_path_buf(),
+                command: vec![
+                    "/bin/sh".to_string(),
+                    "-lc".to_string(),
+                    "printf ok".to_string(),
+                ],
+                mode: CommandMode::OneShot,
+                sandbox: SandboxSpec::default(),
+                detach_key: "C-b d".to_string(),
+                env: BTreeMap::new(),
+            })
+            .unwrap()
+    }
+
+    fn request_lines_with_spawn(
+        store: &Store,
+        request: Value,
+        spawn_daemon: impl Fn(&Store, &SessionRecord) -> Result<()>,
+    ) -> Result<Vec<Value>> {
+        let (mut client, mut server) = UnixStream::pair()?;
+        serde_json::to_writer(&mut client, &request)?;
+        client.write_all(b"\n")?;
+        client.shutdown(Shutdown::Write)?;
+
+        if let Err(err) = handle_connection_with_spawn(store, &mut server, spawn_daemon) {
+            write_error(&mut server, &err.to_string())?;
+        }
+        drop(server);
+
+        let mut raw = String::new();
+        client.read_to_string(&mut raw)?;
+        raw.lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
 
     #[test]
     fn read_request_parses_versioned_rpc_envelope() {
@@ -352,5 +429,294 @@ mod tests {
         client.write_all(b"{\"v\":1,\"op\":\"ping\"}\n").unwrap();
         let request = read_request(&server).unwrap();
         assert!(matches!(request, RpcRequest::Ping));
+    }
+
+    #[test]
+    fn read_request_rejects_empty_and_unsupported_versions() {
+        let (client, server) = UnixStream::pair().unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let err = read_request(&server).unwrap_err();
+        assert!(err.to_string().contains("empty rpc request"));
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(b"{\"v\":9,\"op\":\"ping\"}\n").unwrap();
+        let err = read_request(&server).unwrap_err();
+        assert!(err.to_string().contains("unsupported rpc version 9"));
+    }
+
+    #[test]
+    fn default_socket_path_uses_store_base_dir() {
+        let (_tmp, store) = make_store();
+        assert_eq!(
+            default_socket_path(&store),
+            store.base_dir().join("rpc.sock")
+        );
+    }
+
+    #[test]
+    fn rpc_requests_cover_create_list_inspect_rename_wait_and_filter_errors() {
+        let (tmp, store) = make_store();
+        let created = request_lines_with_spawn(
+            &store,
+            json!({
+                "v": 1,
+                "op": "create",
+                "name": "alpha",
+                "cwd": tmp.path(),
+                "env": {
+                    "USER_TOKEN": "abc123"
+                }
+            }),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        let created = created.first().unwrap();
+        assert_eq!(created["type"], "result");
+
+        let hash = created["result"]["id_hash"].as_str().unwrap().to_string();
+        let created = store.session_by_hash(&hash).unwrap();
+        assert_eq!(created.current_name, "alpha");
+        assert_eq!(created.mode, CommandMode::Shell);
+        assert_eq!(created.command, runtime::default_shell_command());
+        assert_eq!(created.detach_key, "C-b d");
+        assert_eq!(created.status, SessionStatus::Starting);
+        assert_eq!(
+            created.env.get("USER_TOKEN").map(String::as_str),
+            Some("abc123")
+        );
+
+        store.mark_live(&hash, 1, None).unwrap();
+
+        let listed =
+            request_lines_with_spawn(&store, json!({"v": 1, "op": "list"}), |_, _| Ok(())).unwrap();
+        assert_eq!(listed[0]["type"], "result");
+        assert_eq!(listed[0]["result"].as_array().unwrap().len(), 1);
+
+        let inspected = request_lines_with_spawn(
+            &store,
+            json!({"v": 1, "op": "inspect", "target": hash}),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(inspected[0]["result"]["current_name"], "alpha");
+
+        let renamed = request_lines_with_spawn(
+            &store,
+            json!({
+                "v": 1,
+                "op": "rename",
+                "target": hash,
+                "new_name": "beta"
+            }),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(renamed[0]["result"]["current_name"], "beta");
+
+        store.mark_exited(&hash, Some(0)).unwrap();
+
+        let dead = request_lines_with_spawn(
+            &store,
+            json!({"v": 1, "op": "list", "dead": true}),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(dead[0]["result"].as_array().unwrap().len(), 1);
+
+        let waited = request_lines_with_spawn(
+            &store,
+            json!({"v": 1, "op": "wait", "target": hash, "timeout_secs": 1}),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(waited[0]["result"]["exit_code"], 0);
+
+        let err = request_lines_with_spawn(
+            &store,
+            json!({"v": 1, "op": "list", "dead": true, "all": true}),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(err[0]["type"], "error");
+        assert!(
+            err[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("dead and all cannot both be true")
+        );
+    }
+
+    #[test]
+    fn rpc_requests_cover_write_signal_and_stream_subscriptions() {
+        let (tmp, store) = make_store();
+
+        let write_session = create_session(&store, tmp.path(), "writer");
+        let listener = UnixListener::bind(&write_session.socket_path).unwrap();
+        store
+            .mark_live(&write_session.id_hash, std::process::id(), None)
+            .unwrap();
+        let wrote = request_lines_with_spawn(
+            &store,
+            json!({
+                "v": 1,
+                "op": "write",
+                "target": write_session.id_hash,
+                "data_b64": base64::engine::general_purpose::STANDARD.encode(b"hello\n"),
+            }),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(wrote[0]["result"]["ok"], true);
+        let (mut input_stream, _) = listener.accept().unwrap();
+        let mut input = Vec::new();
+        input_stream.read_to_end(&mut input).unwrap();
+        assert_eq!(input, b"Ihello\n");
+
+        let signal_session = create_session(&store, tmp.path(), "signaler");
+        let mut child = Command::new("/bin/sh");
+        child.args(["-lc", "trap 'exit 0' TERM; while :; do sleep 1; done"]);
+        // SAFETY: setsid is called in the child just before exec to isolate its process group.
+        unsafe {
+            child.pre_exec(|| {
+                setsid().map_err(std::io::Error::other)?;
+                Ok(())
+            });
+        }
+        let mut child = child.spawn().unwrap();
+        store
+            .mark_live(
+                &signal_session.id_hash,
+                std::process::id(),
+                Some(child.id()),
+            )
+            .unwrap();
+        let signaled = request_lines_with_spawn(
+            &store,
+            json!({
+                "v": 1,
+                "op": "signal",
+                "target": signal_session.id_hash,
+                "signal": "TERM",
+            }),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(signaled[0]["result"]["ok"], true);
+        child.wait().unwrap();
+        let events = std::fs::read_to_string(signal_session.events_path).unwrap();
+        assert!(events.contains("\"kind\":\"signal\""));
+
+        let output_session = create_session(&store, tmp.path(), "output");
+        std::fs::write(&output_session.log_path, b"chunk-1\nchunk-2\n").unwrap();
+        store.mark_exited(&output_session.id_hash, Some(0)).unwrap();
+        let output_lines = request_lines_with_spawn(
+            &store,
+            json!({
+                "v": 1,
+                "op": "subscribe_output",
+                "target": output_session.id_hash,
+                "follow": false,
+            }),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(output_lines.last().unwrap()["type"], "done");
+        let chunks = output_lines
+            .iter()
+            .filter(|line| line["type"] == "output")
+            .map(|line| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(line["data_b64"].as_str().unwrap())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(chunks.concat(), b"chunk-1\nchunk-2\n");
+
+        let events_session = create_session(&store, tmp.path(), "events");
+        store
+            .append_event(
+                &events_session,
+                EventRecord {
+                    ts: chrono::Utc::now(),
+                    kind: "renamed".to_string(),
+                    detail: json!({"current_name": "events"}),
+                },
+            )
+            .unwrap();
+        std::fs::write(
+            &events_session.events_path,
+            [
+                std::fs::read(&events_session.events_path).unwrap(),
+                b"\n".to_vec(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        store.mark_exited(&events_session.id_hash, Some(0)).unwrap();
+        let event_lines = request_lines_with_spawn(
+            &store,
+            json!({
+                "v": 1,
+                "op": "subscribe_events",
+                "target": events_session.id_hash,
+                "follow": false,
+            }),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(event_lines.last().unwrap()["type"], "done");
+        let kinds = event_lines
+            .iter()
+            .filter(|line| line["type"] == "event")
+            .filter_map(|line| line["event"]["kind"].as_str())
+            .collect::<Vec<_>>();
+        assert!(kinds.iter().any(|kind| *kind == "created"));
+        assert!(kinds.iter().any(|kind| *kind == "renamed"));
+
+        let err = request_lines_with_spawn(
+            &store,
+            json!({
+                "v": 1,
+                "op": "write",
+                "target": write_session.id_hash,
+                "data_b64": "%%%not-base64%%%",
+            }),
+            |_, _| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(err[0]["type"], "error");
+        assert!(
+            err[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("invalid data_b64 payload")
+        );
+    }
+
+    #[test]
+    fn flush_event_messages_keeps_partial_lines_and_skips_blank_ones() {
+        let event = EventRecord {
+            ts: chrono::Utc::now(),
+            kind: "created".to_string(),
+            detail: json!({"name": "demo"}),
+        };
+        let encoded = serde_json::to_vec(&event).unwrap();
+        let mut pending = [encoded.clone(), b"\n\n".to_vec(), encoded[..5].to_vec()].concat();
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+
+        flush_event_messages(&mut server, &mut pending).unwrap();
+        assert_eq!(pending, encoded[..5].to_vec());
+        drop(server);
+
+        let mut raw = String::new();
+        client.read_to_string(&mut raw).unwrap();
+        let lines = raw
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["type"], "event");
+        assert_eq!(lines[0]["event"]["kind"], "created");
     }
 }
