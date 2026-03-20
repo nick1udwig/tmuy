@@ -3,7 +3,17 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp_dir="$(mktemp -d)"
-trap 'rm -rf "${tmp_dir}"' EXIT
+busy_pid=""
+
+cleanup() {
+  if [[ -n "${busy_pid}" ]]; then
+    kill "${busy_pid}" >/dev/null 2>&1 || true
+    wait "${busy_pid}" 2>/dev/null || true
+  fi
+  rm -rf "${tmp_dir}"
+}
+
+trap cleanup EXIT
 
 version="v9.9.9"
 target="x86_64-unknown-linux-gnu"
@@ -98,5 +108,21 @@ PATH="${mock_bin_dir}:/usr/bin:/bin" \
 
 test -x "${tmp_dir}/install-bin-2/tmuy"
 [[ "$("${tmp_dir}/install-bin-2/tmuy")" == "tmuy fake" ]]
+
+cp "$(command -v sleep)" "${install_bin_dir}/tmuy"
+"${install_bin_dir}/tmuy" 30 &
+busy_pid=$!
+sleep 1
+
+PATH="${mock_bin_dir}:/usr/bin:/bin" \
+  MOCK_RELEASE_DIR="${release_dir}" \
+  HOME="${tmp_dir}/home" \
+  sh "${repo_root}/install.sh" -b "${install_bin_dir}" -v "${version}"
+
+kill -0 "${busy_pid}"
+[[ "$("${install_bin_dir}/tmuy")" == "tmuy fake" ]]
+kill "${busy_pid}" >/dev/null 2>&1 || true
+wait "${busy_pid}" 2>/dev/null || true
+busy_pid=""
 
 printf 'install script smoke tests passed\n'

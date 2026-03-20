@@ -274,6 +274,12 @@ fn handle_client(mut stream: UnixStream, state: ServerState) -> Result<()> {
             let size = read_attach_size(&mut stream)?;
             handle_attach_client(stream, state, size)
         }
+        b'R' => {
+            let size = read_attach_size(&mut stream)?;
+            let master = state.master.lock().expect("pty master poisoned");
+            master.resize(size)?;
+            Ok(())
+        }
         b'I' => {
             let mut input = Vec::new();
             stream.read_to_end(&mut input)?;

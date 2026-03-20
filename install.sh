@@ -119,6 +119,7 @@ install_binary() {
   checksum_file="$2"
   target_bin="$3"
   temp_dir="$4"
+  staged_bin=""
 
   expected="$(awk '{print $1; exit}' "${checksum_file}")"
   [ -n "${expected}" ] || die "failed to read checksum from ${checksum_file}"
@@ -130,8 +131,13 @@ install_binary() {
   [ -f "${temp_dir}/${PROJECT}" ] || die "release archive did not contain ${PROJECT}"
 
   mkdir -p "${BIN_DIR}"
-  cp "${temp_dir}/${PROJECT}" "${target_bin}"
-  chmod +x "${target_bin}"
+  staged_bin="$(mktemp "${BIN_DIR}/.${PROJECT}.tmp.XXXXXX")"
+  cp "${temp_dir}/${PROJECT}" "${staged_bin}"
+  chmod 755 "${staged_bin}"
+  if ! mv -f "${staged_bin}" "${target_bin}"; then
+    rm -f "${staged_bin}"
+    die "failed to replace ${target_bin}"
+  fi
 }
 
 while [ "$#" -gt 0 ]; do
@@ -159,8 +165,11 @@ done
 need_cmd uname
 need_cmd tar
 need_cmd mkdir
+need_cmd mktemp
 need_cmd cp
 need_cmd chmod
+need_cmd mv
+need_cmd rm
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT INT HUP TERM
