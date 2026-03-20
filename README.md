@@ -27,6 +27,7 @@ CLI plus `--json`.
 - read state with `ls --json` and `inspect --json`
 - write exact bytes with `send --no-enter`
 - read exact output bytes with `tail --raw --follow`
+- follow structured lifecycle events with `events --follow --jsonl`
 - wait for completion with `wait --json`
 
 The hidden `__serve` subcommand and the Unix socket wire format are internal.
@@ -71,6 +72,7 @@ Reconnect later:
 tmuy attach ios
 tmuy send ios "git status"
 tmuy tail -f ios
+tmuy events ios --follow --jsonl
 tmuy wait ios --timeout-secs 300
 ```
 

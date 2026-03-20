@@ -109,6 +109,82 @@ pub fn tail(store: &Store, name: &str, raw: bool, follow: bool) -> Result<()> {
     }
 }
 
+pub fn events(store: &Store, name: &str, jsonl: bool, follow: bool) -> Result<()> {
+    let session = store.resolve_target(name, SessionScope::All)?;
+    let hash = session.id_hash.clone();
+    let events_path = session.events_path.clone();
+    let mut position = 0u64;
+    let mut pending = Vec::new();
+
+    loop {
+        if events_path.exists() {
+            let mut file = File::open(&events_path)?;
+            let len = file.metadata()?.len();
+            if len > position {
+                let to_read = (len - position) as usize;
+                let mut buf = vec![0u8; to_read];
+                file.seek(std::io::SeekFrom::Start(position))?;
+                file.read_exact(&mut buf)?;
+                pending.extend_from_slice(&buf);
+                let mut stdout = io::stdout();
+                flush_event_lines_to(&mut pending, jsonl, &mut stdout)?;
+                position = len;
+            }
+        }
+        if !follow {
+            let mut stdout = io::stdout();
+            flush_event_lines_to(&mut pending, jsonl, &mut stdout)?;
+            return Ok(());
+        }
+        let refreshed = store.session_by_hash(&hash)?;
+        if !refreshed.status.is_live() && events_path.exists() {
+            let len = fs::metadata(&events_path)?.len();
+            if len <= position {
+                let mut stdout = io::stdout();
+                flush_event_lines_to(&mut pending, jsonl, &mut stdout)?;
+                return Ok(());
+            }
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn flush_event_lines_to(pending: &mut Vec<u8>, jsonl: bool, writer: &mut impl Write) -> Result<()> {
+    let mut consumed = 0usize;
+    while let Some(offset) = pending[consumed..].iter().position(|byte| *byte == b'\n') {
+        let line_end = consumed + offset;
+        emit_event_line(writer, &pending[consumed..line_end], jsonl)?;
+        consumed = line_end + 1;
+    }
+    if consumed > 0 {
+        pending.drain(..consumed);
+    }
+    Ok(())
+}
+
+fn emit_event_line(stdout: &mut impl Write, line: &[u8], jsonl: bool) -> Result<()> {
+    if line.is_empty() {
+        return Ok(());
+    }
+    if jsonl {
+        stdout.write_all(line)?;
+        stdout.write_all(b"\n")?;
+        stdout.flush()?;
+        return Ok(());
+    }
+
+    let event: EventRecord = serde_json::from_slice(line)?;
+    writeln!(
+        stdout,
+        "{}\t{}\t{}",
+        event.ts,
+        event.kind,
+        serde_json::to_string(&event.detail)?
+    )?;
+    stdout.flush()?;
+    Ok(())
+}
+
 pub fn signal_session(store: &Store, name: &str, signal_name: &str) -> Result<()> {
     let session = store.resolve_target(name, SessionScope::LiveOnly)?;
     let pid = session
@@ -152,11 +228,34 @@ pub fn wait_for_exit(
 
 #[cfg(test)]
 mod tests {
-    use super::attach_handshake_payload;
+    use super::{attach_handshake_payload, flush_event_lines_to};
+    use crate::model::EventRecord;
 
     #[test]
     fn attach_handshake_uses_usable_rows_and_cols() {
         assert_eq!(attach_handshake_payload(8, 40), [b'A', 0, 7, 0, 40]);
         assert_eq!(attach_handshake_payload(1, 0), [b'A', 0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn flush_event_lines_keeps_partial_line_until_newline() {
+        let event = EventRecord {
+            ts: chrono::Utc::now(),
+            kind: "created".to_string(),
+            detail: serde_json::json!({"name": "demo"}),
+        };
+        let line = serde_json::to_vec(&event).unwrap();
+        let mut output = Vec::new();
+
+        let mut pending = line[..line.len() / 2].to_vec();
+        flush_event_lines_to(&mut pending, true, &mut output).unwrap();
+        assert!(!pending.is_empty());
+        assert!(output.is_empty());
+
+        pending.extend_from_slice(&line[line.len() / 2..]);
+        pending.push(b'\n');
+        flush_event_lines_to(&mut pending, true, &mut output).unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(output, [line, b"\n".to_vec()].concat());
     }
 }

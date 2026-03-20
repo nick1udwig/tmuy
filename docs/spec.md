@@ -10,6 +10,7 @@
 - `tmuy kill <name>`
 - `tmuy ls|list|l [--dead|--all]`
 - `tmuy tail <name> [--raw] [-f|--follow]`
+- `tmuy events <name> [--jsonl] [-f|--follow]`
 - `tmuy inspect <name>`
 - `tmuy send <name> [payload]`
 - `tmuy rename <name> <new-name>`
@@ -27,6 +28,7 @@ CLI plus `--json`.
 - read state with `ls --json` and `inspect --json`
 - write input with `send`, using `--no-enter` for exact bytes
 - read output with `tail --raw` or `tail --raw --follow`
+- follow lifecycle events with `events --jsonl --follow`
 - wait for exit with `wait --json`
 
 The hidden `__serve` subcommand, per-session socket protocol, and direct writes
