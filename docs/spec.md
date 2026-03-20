@@ -10,12 +10,34 @@
 - `tmuy kill <name>`
 - `tmuy ls|list|l [--dead|--all]`
 - `tmuy tail <name> [--raw] [-f|--follow]`
+- `tmuy events <name> [--jsonl] [-f|--follow]`
 - `tmuy inspect <name>`
 - `tmuy send <name> [payload]`
 - `tmuy rename <name> <new-name>`
 - `tmuy wait <name> [--timeout-secs N]`
 - `tmuy signal <name> <INT|TERM|KILL|HUP>`
+- `tmuy rpc serve [--socket PATH]`
 - Global: `--json`
+
+## Automation API
+
+For third-party programs, the supported machine-facing interface in `v0` is the
+CLI plus `--json`.
+
+- create sessions with `new --json --detached`
+- use the returned stable session hash for later calls
+- read state with `ls --json` and `inspect --json`
+- write input with `send`, using `--no-enter` for exact bytes
+- read output with `tail --raw` or `tail --raw --follow`
+- follow lifecycle events with `events --jsonl --follow`
+- use `rpc serve` for a versioned local control socket
+- wait for exit with `wait --json`
+
+The hidden `__serve` subcommand, per-session socket protocol, and direct writes
+to files under `~/.tmuy` are not public APIs.
+
+See [`docs/automation.md`](automation.md) for the canonical automation flow.
+See [`docs/rpc-v1.md`](rpc-v1.md) for the local RPC protocol.
 
 ## Core rules
 

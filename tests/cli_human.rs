@@ -26,17 +26,19 @@ fn ls_human_prints_no_sessions() -> Result<()> {
 #[test]
 fn subcommand_help_includes_user_facing_descriptions() -> Result<()> {
     let home = TempDir::new()?;
-    let cases: [(&[&str], &str); 10] = [
+    let cases: [(&[&str], &str); 12] = [
         (&["new", "--help"], "Create a new session"),
         (&["attach", "--help"], "Attach to a live session"),
         (&["kill", "--help"], "Send a Ctrl+C-style interrupt"),
         (&["ls", "--help"], "List live sessions"),
         (&["tail", "--help"], "Print or follow terminal output"),
+        (&["events", "--help"], "Print or follow session events"),
         (&["inspect", "--help"], "Show full metadata"),
         (&["send", "--help"], "pressing Enter by default"),
         (&["rename", "--help"], "Rename a live session"),
         (&["wait", "--help"], "Wait for a session to exit"),
         (&["signal", "--help"], "Send a specific POSIX signal"),
+        (&["rpc", "--help"], "Serve the versioned local RPC API"),
     ];
 
     for (args, needle) in cases {

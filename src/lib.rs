@@ -1,5 +1,6 @@
 mod cli;
 mod model;
+mod rpc;
 mod runtime;
 mod sandbox;
 mod store;

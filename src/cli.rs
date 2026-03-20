@@ -7,6 +7,7 @@ use clap::{ArgAction, Parser, Subcommand};
 use serde::Serialize;
 
 use crate::model::{CommandMode, SessionRecord, SessionScope};
+use crate::rpc;
 use crate::runtime;
 use crate::store::{CreateSessionRequest, Store, parse_sandbox, validate_name};
 
@@ -44,6 +45,8 @@ enum Commands {
     Ls(ListArgs),
     /// Print or follow terminal output from a session log.
     Tail(TailArgs),
+    /// Print or follow session events from the official event stream.
+    Events(EventsArgs),
     /// Show full metadata for a session, including paths and sandbox settings.
     Inspect(NameArgs),
     /// Send input to a detached or attached live session, pressing Enter by default.
@@ -54,6 +57,8 @@ enum Commands {
     Wait(WaitArgs),
     /// Send a specific POSIX signal to a live session process group.
     Signal(SignalArgs),
+    /// Serve the versioned local RPC API over a Unix socket.
+    Rpc(RpcArgs),
     #[command(hide = true, name = "__serve")]
     Serve(ServeArgs),
 }
@@ -126,6 +131,20 @@ struct TailArgs {
 }
 
 #[derive(clap::Args, Debug)]
+struct EventsArgs {
+    /// Session name or hash to read events from.
+    name: String,
+
+    /// Emit newline-delimited JSON event records.
+    #[arg(long, action = ArgAction::SetTrue)]
+    jsonl: bool,
+
+    /// Keep streaming new events until the session exits and events are drained.
+    #[arg(short = 'f', long)]
+    follow: bool,
+}
+
+#[derive(clap::Args, Debug)]
 struct NameArgs {
     /// Session name or hash to inspect.
     name: String,
@@ -168,6 +187,25 @@ struct SignalArgs {
     name: String,
     /// Signal name such as `INT`, `TERM`, or `HUP`.
     signal: String,
+}
+
+#[derive(clap::Args, Debug)]
+struct RpcArgs {
+    #[command(subcommand)]
+    command: RpcCommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum RpcCommands {
+    /// Listen for versioned RPC requests on a Unix socket.
+    Serve(RpcServeArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct RpcServeArgs {
+    /// Override the default RPC socket path.
+    #[arg(long)]
+    socket: Option<std::path::PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -214,6 +252,7 @@ pub fn run() -> Result<()> {
         }
         Commands::Ls(args) => cmd_ls(&store, cli.json, args),
         Commands::Tail(args) => runtime::tail(&store, &args.name, args.raw, args.follow),
+        Commands::Events(args) => runtime::events(&store, &args.name, args.jsonl, args.follow),
         Commands::Inspect(args) => {
             let session = store.resolve_target(&args.name, SessionScope::All)?;
             if cli.json {
@@ -283,6 +322,9 @@ pub fn run() -> Result<()> {
             )?;
             Ok(())
         }
+        Commands::Rpc(args) => match args.command {
+            RpcCommands::Serve(args) => rpc::run_rpc_server(&store, args.socket),
+        },
         Commands::Serve(args) => match runtime::run_server(&store, &args.hash) {
             Ok(()) => Ok(()),
             Err(err) => {
@@ -341,7 +383,8 @@ fn should_auto_attach(json: bool, detached: bool, mode: &CommandMode) -> bool {
 }
 
 fn ensure_attach_allowed() -> Result<()> {
-    if let Some(hash) = std::env::var_os("TMUY_SESSION_HASH") {
+    let inside_tmuy = std::env::var_os("TMUY_INSIDE").as_deref() == Some("1".as_ref());
+    if inside_tmuy && let Some(hash) = std::env::var_os("TMUY_SESSION_HASH") {
         bail!(
             "cannot attach from inside tmuy session {}; detach first or create the new session with --detached",
             hash.to_string_lossy()

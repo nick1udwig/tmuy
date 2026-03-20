@@ -87,6 +87,9 @@ pub fn run_server(store: &Store, hash: &str) -> Result<()> {
     let child_pid = child.process_id().map(|pid| pid as u32);
     drop(pair.slave);
 
+    let listener = UnixListener::bind(&session.socket_path)?;
+    listener.set_nonblocking(true)?;
+
     let _ = store.mark_live(hash, std::process::id(), child_pid)?;
     let session = store.session_by_hash(hash)?;
     store.append_event(
@@ -100,9 +103,6 @@ pub fn run_server(store: &Store, hash: &str) -> Result<()> {
             }),
         },
     )?;
-
-    let listener = UnixListener::bind(&session.socket_path)?;
-    listener.set_nonblocking(true)?;
 
     let master = Arc::new(Mutex::new(pair.master));
     let mut reader = {

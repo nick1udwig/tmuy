@@ -153,11 +153,22 @@ jobs:
           RELEASE_REPO: ${{ github.repository }}
         run: |
           if gh release view "${RELEASE_TAG}" --repo "${RELEASE_REPO}" >/dev/null 2>&1; then
+            notes_file="$(mktemp)"
+            trap 'rm -f "${notes_file}"' EXIT
+            gh api "repos/${RELEASE_REPO}/releases/generate-notes" \
+              --method POST \
+              -f tag_name="${RELEASE_TAG}" \
+              -f target_commitish="${RELEASE_SHA}" \
+              --jq '.body' > "${notes_file}"
+            gh release edit "${RELEASE_TAG}" \
+              --repo "${RELEASE_REPO}" \
+              --title "${RELEASE_TAG}" \
+              --notes-file "${notes_file}"
             gh release upload "${RELEASE_TAG}" dist/* --repo "${RELEASE_REPO}" --clobber
           else
             gh release create "${RELEASE_TAG}" dist/* \
               --repo "${RELEASE_REPO}" \
               --target "${RELEASE_SHA}" \
               --title "${RELEASE_TAG}" \
-              --notes "Automated release for ${RELEASE_TAG}"
+              --generate-notes
           fi

@@ -169,6 +169,7 @@ impl Store {
             let socket_path = self.live_dir().join(format!("{id_hash}.sock"));
 
             let mut env = req.env.clone();
+            env.insert("TMUY_INSIDE".to_string(), "1".to_string());
             env.insert("TMUY_SESSION_HASH".to_string(), id_hash.clone());
             env.insert(
                 "TMUY_SESSION_STARTED_NAME".to_string(),
@@ -607,6 +608,20 @@ mod tests {
         let events = std::fs::read_to_string(created.events_path).unwrap();
         assert!(events.contains("\"kind\":\"created\""));
         assert!(events.contains("\"name\":\"alpha\""));
+    }
+
+    #[test]
+    fn create_session_marks_child_env_as_inside_tmuy() {
+        let (_tmp, store) = make_store();
+        let created = store.create_session(base_request(Some("alpha"))).unwrap();
+        assert_eq!(
+            created.env.get("TMUY_INSIDE").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            created.env.get("TMUY_SESSION_HASH").map(String::as_str),
+            Some(created.id_hash.as_str())
+        );
     }
 
     #[test]

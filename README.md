@@ -17,6 +17,24 @@ Sandboxing via [Bubblewrap](https://github.com/containers/bubblewrap) on Linux.
 - built-in `send`, `tail`, `wait`, `inspect`, and `--json`
 - logs and metadata are persisted automatically
 
+## Automation API
+
+For third-party programs, the supported machine-facing interface is the `tmuy`
+CLI plus `--json`.
+
+- create sessions with `tmuy --json new ... --detached`
+- keep the returned stable `id_hash`
+- read state with `ls --json` and `inspect --json`
+- write exact bytes with `send --no-enter`
+- read exact output bytes with `tail --raw --follow`
+- follow structured lifecycle events with `events --follow --jsonl`
+- use `tmuy rpc serve` for a versioned local control socket
+- wait for completion with `wait --json`
+
+The hidden `__serve` subcommand and the Unix socket wire format are internal.
+
+See [`docs/automation.md`](docs/automation.md) for the canonical automation flow.
+
 ## Install
 
 ```bash
@@ -55,6 +73,7 @@ Reconnect later:
 tmuy attach ios
 tmuy send ios "git status"
 tmuy tail -f ios
+tmuy events ios --follow --jsonl
 tmuy wait ios --timeout-secs 300
 ```
 
@@ -71,6 +90,12 @@ Run a restricted session on Linux:
 tmuy new review --fs ro:. --net off -- /bin/sh -lc "rg TODO src"
 ```
 
+Serve the RPC control API:
+
+```bash
+tmuy rpc serve
+```
+
 ## Typical Use Cases
 
 - keep a Codex or Claude Code session alive while you switch devices
@@ -84,4 +109,6 @@ tmuy new review --fs ro:. --net off -- /bin/sh -lc "rg TODO src"
 - restricted sandboxing is currently Linux-only via `bubblewrap`
 - session data lives under `~/.tmuy` by default
 
-For more detail, see [`docs/spec.md`](docs/spec.md).
+For more detail, see [`docs/spec.md`](docs/spec.md),
+[`docs/automation.md`](docs/automation.md), and
+[`docs/rpc-v1.md`](docs/rpc-v1.md).
