@@ -341,7 +341,8 @@ fn should_auto_attach(json: bool, detached: bool, mode: &CommandMode) -> bool {
 }
 
 fn ensure_attach_allowed() -> Result<()> {
-    if let Some(hash) = std::env::var_os("TMUY_SESSION_HASH") {
+    let inside_tmuy = std::env::var_os("TMUY_INSIDE").as_deref() == Some("1".as_ref());
+    if inside_tmuy && let Some(hash) = std::env::var_os("TMUY_SESSION_HASH") {
         bail!(
             "cannot attach from inside tmuy session {}; detach first or create the new session with --detached",
             hash.to_string_lossy()
