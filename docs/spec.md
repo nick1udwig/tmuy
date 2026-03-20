@@ -17,6 +17,23 @@
 - `tmuy signal <name> <INT|TERM|KILL|HUP>`
 - Global: `--json`
 
+## Automation API
+
+For third-party programs, the supported machine-facing interface in `v0` is the
+CLI plus `--json`.
+
+- create sessions with `new --json --detached`
+- use the returned stable session hash for later calls
+- read state with `ls --json` and `inspect --json`
+- write input with `send`, using `--no-enter` for exact bytes
+- read output with `tail --raw` or `tail --raw --follow`
+- wait for exit with `wait --json`
+
+The hidden `__serve` subcommand, per-session socket protocol, and direct writes
+to files under `~/.tmuy` are not public APIs.
+
+See [`docs/automation.md`](automation.md) for the canonical automation flow.
+
 ## Core rules
 
 - `tmuy new [name]` starts the user shell as an interactive PTY session.

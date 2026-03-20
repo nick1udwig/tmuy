@@ -17,6 +17,22 @@ Sandboxing via [Bubblewrap](https://github.com/containers/bubblewrap) on Linux.
 - built-in `send`, `tail`, `wait`, `inspect`, and `--json`
 - logs and metadata are persisted automatically
 
+## Automation API
+
+For third-party programs, the supported machine-facing interface is the `tmuy`
+CLI plus `--json`.
+
+- create sessions with `tmuy --json new ... --detached`
+- keep the returned stable `id_hash`
+- read state with `ls --json` and `inspect --json`
+- write exact bytes with `send --no-enter`
+- read exact output bytes with `tail --raw --follow`
+- wait for completion with `wait --json`
+
+The hidden `__serve` subcommand and the Unix socket wire format are internal.
+
+See [`docs/automation.md`](docs/automation.md) for the canonical automation flow.
+
 ## Install
 
 ```bash
@@ -84,4 +100,5 @@ tmuy new review --fs ro:. --net off -- /bin/sh -lc "rg TODO src"
 - restricted sandboxing is currently Linux-only via `bubblewrap`
 - session data lives under `~/.tmuy` by default
 
-For more detail, see [`docs/spec.md`](docs/spec.md).
+For more detail, see [`docs/spec.md`](docs/spec.md) and
+[`docs/automation.md`](docs/automation.md).
