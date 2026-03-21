@@ -459,6 +459,39 @@ fn attach_shows_status_bar_immediately_for_quiet_sessions() -> Result<()> {
 }
 
 #[test]
+fn attach_enables_bracketed_paste_for_quiet_sessions() -> Result<()> {
+    let home = TempDir::new()?;
+    let created = run_tmuy(
+        home.path(),
+        &["new", "quiet-paste", "--", "/bin/sh", "-lc", "sleep 30"],
+    )?;
+    assert_success(&created);
+
+    let mut attach = spawn_attach(home.path(), &["attach", "quiet-paste"])?;
+    let initial = attach.read_until_contains("tmuy quiet-paste", Duration::from_secs(5))?;
+    assert!(
+        initial.contains("\u{1b}[?2004h"),
+        "attach transcript did not enable bracketed paste:\n{initial:?}"
+    );
+
+    attach.write_all(&[0x02, b'd'])?;
+    let status = attach.wait_for_exit(Duration::from_secs(5))?;
+    assert!(status.success(), "attach exit status was {status:?}");
+    let final_output = attach.read_for(Duration::from_millis(300))?;
+    assert!(
+        final_output.contains("\u{1b}[?2004l"),
+        "attach transcript did not disable bracketed paste:\n{final_output:?}"
+    );
+
+    assert_success(&run_tmuy(home.path(), &["kill", "quiet-paste"])?);
+    assert_success(&run_tmuy(
+        home.path(),
+        &["wait", "quiet-paste", "--timeout-secs", "5"],
+    )?);
+    Ok(())
+}
+
+#[test]
 fn attach_preserves_reverse_search_screen_for_long_history_entries() -> Result<()> {
     let home = TempDir::new()?;
     let created = run_tmuy(

@@ -2,6 +2,7 @@ use std::io::{self, Write};
 
 use anyhow::Result;
 use crossterm::cursor::{MoveTo, RestorePosition, SavePosition};
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
 use crossterm::terminal::disable_raw_mode;
 use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, size};
@@ -17,6 +18,8 @@ pub(super) struct StatusBarGuard {
 
 pub(super) struct AlternateScreenGuard;
 
+pub(super) struct BracketedPasteGuard;
+
 impl AlternateScreenGuard {
     pub(super) fn enter() -> Result<Self> {
         let mut stdout = io::stdout();
@@ -30,10 +33,25 @@ impl AlternateScreenGuard {
     }
 }
 
+impl BracketedPasteGuard {
+    pub(super) fn enter() -> Result<Self> {
+        let mut stdout = io::stdout();
+        execute!(stdout, EnableBracketedPaste)?;
+        Ok(Self)
+    }
+}
+
 impl Drop for AlternateScreenGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
         let _ = execute!(stdout, LeaveAlternateScreen, ResetColor);
+    }
+}
+
+impl Drop for BracketedPasteGuard {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, DisableBracketedPaste);
     }
 }
 

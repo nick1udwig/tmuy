@@ -13,7 +13,7 @@ use crate::store::Store;
 use super::protocol::{
     attach_input_loop, detach_sequence, is_peer_closed, parse_signal, signal_process_group,
 };
-use super::ui::{AlternateScreenGuard, RawModeGuard, StatusBarGuard};
+use super::ui::{AlternateScreenGuard, BracketedPasteGuard, RawModeGuard, StatusBarGuard};
 
 pub fn attach(store: &Store, name: &str, detach_key: &str) -> Result<()> {
     let session = store.resolve_target(name, SessionScope::LiveOnly)?;
@@ -29,6 +29,7 @@ pub fn attach(store: &Store, name: &str, detach_key: &str) -> Result<()> {
 
     enable_raw_mode()?;
     let _restore = RawModeGuard;
+    let _paste = BracketedPasteGuard::enter()?;
     let _screen = AlternateScreenGuard::enter()?;
     let status_bar = StatusBarGuard::enter(&session, detach_key)?;
     thread::spawn(move || {
