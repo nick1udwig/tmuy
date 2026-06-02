@@ -1,6 +1,11 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, Write};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,7 +18,7 @@ use crate::store::Store;
 use super::protocol::{
     attach_input_loop, detach_sequence, is_peer_closed, parse_signal, signal_process_group,
 };
-use super::ui::{AlternateScreenGuard, BracketedPasteGuard, RawModeGuard, StatusBarGuard};
+use super::ui::{BracketedPasteGuard, RawModeGuard};
 
 pub fn attach(store: &Store, name: &str, detach_key: &str) -> Result<()> {
     let session = store.resolve_target(name, SessionScope::LiveOnly)?;
@@ -21,7 +26,7 @@ pub fn attach(store: &Store, name: &str, detach_key: &str) -> Result<()> {
         .with_context(|| format!("failed to connect to {}", session.socket_path.display()))?;
     let mut write_stream = stream;
     let (cols, rows) = size().unwrap_or((80, 24));
-    write_stream.write_all(&attach_handshake_payload(rows, cols))?;
+    write_stream.write_all(&sized_control_payload(b'A', rows, cols))?;
     write_stream.flush()?;
     let mut read_stream = write_stream.try_clone()?;
     let seq = detach_sequence(detach_key)?;
@@ -30,37 +35,71 @@ pub fn attach(store: &Store, name: &str, detach_key: &str) -> Result<()> {
     enable_raw_mode()?;
     let _restore = RawModeGuard;
     let _paste = BracketedPasteGuard::enter()?;
-    let _screen = AlternateScreenGuard::enter()?;
-    let status_bar = StatusBarGuard::enter(&session, detach_key)?;
+    let resize_running = Arc::new(AtomicBool::new(true));
+    let resize_thread = spawn_resize_watcher(
+        session.socket_path.clone(),
+        (cols.max(1), rows.max(1)),
+        resize_running.clone(),
+    );
     thread::spawn(move || {
         let _ = attach_input_loop(&mut input_stream, &seq);
     });
     let mut stdout = io::stdout();
     let mut buf = [0u8; 4096];
-    status_bar.render(&mut stdout)?;
     loop {
         match read_stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
                 stdout.write_all(&buf[..n])?;
                 stdout.flush()?;
-                status_bar.render(&mut stdout)?;
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) if is_peer_closed(&err) => break,
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                resize_running.store(false, Ordering::SeqCst);
+                let _ = resize_thread.join();
+                return Err(err.into());
+            }
         }
     }
+    resize_running.store(false, Ordering::SeqCst);
+    let _ = resize_thread.join();
     Ok(())
 }
 
-fn attach_handshake_payload(rows: u16, cols: u16) -> [u8; 5] {
-    let usable_rows = rows.saturating_sub(1).max(1);
+fn sized_control_payload(mode: u8, rows: u16, cols: u16) -> [u8; 5] {
     let mut payload = [0u8; 5];
-    payload[0] = b'A';
-    payload[1..3].copy_from_slice(&usable_rows.to_be_bytes());
+    payload[0] = mode;
+    payload[1..3].copy_from_slice(&rows.max(1).to_be_bytes());
     payload[3..5].copy_from_slice(&cols.max(1).to_be_bytes());
     payload
+}
+
+fn send_resize(socket_path: &Path, rows: u16, cols: u16) -> Result<()> {
+    let mut stream = UnixStream::connect(socket_path)
+        .with_context(|| format!("failed to connect to {}", socket_path.display()))?;
+    stream.write_all(&sized_control_payload(b'R', rows, cols))?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn spawn_resize_watcher(
+    socket_path: std::path::PathBuf,
+    initial_size: (u16, u16),
+    running: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut last_size = initial_size;
+        while running.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(100));
+            let next_size = size().unwrap_or((80, 24));
+            if next_size == last_size {
+                continue;
+            }
+            last_size = next_size;
+            let _ = send_resize(&socket_path, next_size.1, next_size.0);
+        }
+    })
 }
 
 pub fn send_input(store: &Store, name: &str, bytes: &[u8]) -> Result<()> {
@@ -232,6 +271,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::Read;
     use std::os::unix::{net::UnixListener, process::CommandExt};
+    use std::path::PathBuf;
     use std::process::Command;
     use std::time::Duration;
 
@@ -239,8 +279,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        attach_handshake_payload, emit_event_line, flush_event_lines_to, send_input,
-        signal_session, wait_for_exit,
+        emit_event_line, flush_event_lines_to, send_input, send_resize, signal_session,
+        sized_control_payload, wait_for_exit,
     };
     use crate::model::{CommandMode, EventRecord, SandboxSpec, SessionStatus};
     use crate::store::{CreateSessionRequest, Store};
@@ -269,9 +309,23 @@ mod tests {
     }
 
     #[test]
-    fn attach_handshake_uses_usable_rows_and_cols() {
-        assert_eq!(attach_handshake_payload(8, 40), [b'A', 0, 7, 0, 40]);
-        assert_eq!(attach_handshake_payload(1, 0), [b'A', 0, 1, 0, 1]);
+    fn sized_control_payload_uses_full_rows_and_cols() {
+        assert_eq!(sized_control_payload(b'A', 8, 40), [b'A', 0, 8, 0, 40]);
+        assert_eq!(sized_control_payload(b'R', 1, 0), [b'R', 0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn send_resize_writes_mode_byte_and_size_payload() {
+        let tmp = tempdir().unwrap();
+        let socket_path = PathBuf::from(tmp.path()).join("resize.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        send_resize(&socket_path, 18, 70).unwrap();
+
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut data = Vec::new();
+        stream.read_to_end(&mut data).unwrap();
+        assert_eq!(data, [b"R".as_slice(), &[0, 18, 0, 70]].concat());
     }
 
     #[test]

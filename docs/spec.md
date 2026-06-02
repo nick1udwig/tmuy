@@ -129,14 +129,15 @@ Behavior:
 
 - Sessions are hosted by a detached internal service process.
 - `attach` connects to a Unix socket and forwards raw terminal bytes.
-- New attach clients receive a bounded replay of recent PTY output before switching to live bytes, so an already-running shell prompt does not appear blank.
+- `attach` uses the caller's primary screen and does not draw a tmuy-specific status bar or alternate-screen wrapper around the session.
+- New attach clients receive a parser-rendered snapshot of the current terminal screen before switching to live bytes, so an already-running shell prompt or TUI does not appear blank.
+- Snapshot replay strips terminal queries and other non-rendering control traffic instead of resending raw PTY history.
 - PTY output is broadcast to all attached clients and appended to `pty.log`.
-- Resize handling is stubbed for now and remains a post-MVP TODO.
+- Attach clients propagate terminal resizes to the hosted PTY while attached.
 
 ## Post-MVP
 
-- Reliable screen-state replay on attach
-- Resize propagation
+- Snapshot fidelity for terminal features outside the supported parser surface
 - Full sandbox enforcement
 - Richer `tail/read/search`
 - Richer detach-key syntax

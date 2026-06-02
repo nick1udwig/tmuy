@@ -16,7 +16,7 @@ portable-pty = "0.9.0"
 rand = "0.9.2"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+vt100 = "0.16.2"
 
 [dev-dependencies]
 tempfile = "3.23.0"
-vt100 = "0.16.2"

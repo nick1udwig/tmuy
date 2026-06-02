@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -6,12 +6,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use nix::sys::signal::{Signal, kill as send_signal};
 use nix::unistd::Pid;
 use portable_pty::{MasterPty, PtySize, native_pty_system};
+use vt100::Parser as TerminalParser;
 
 use crate::model::{EventRecord, FsGrant, SessionRecord};
 use crate::sandbox;
@@ -19,27 +20,29 @@ use crate::store::Store;
 
 use super::protocol::{is_peer_closed, parse_signal};
 
-const MAX_HISTORY_BYTES: usize = 256 * 1024;
-
 type SharedOutputState = Arc<Mutex<OutputState>>;
+const ATTACH_REDRAW_WAIT: Duration = Duration::from_millis(150);
+const ATTACH_REDRAW_POLL: Duration = Duration::from_millis(10);
 
 struct OutputState {
-    history: VecDeque<u8>,
+    parser: TerminalParser,
+    revision: usize,
     broadcasters: HashMap<usize, Sender<Vec<u8>>>,
 }
 
 impl OutputState {
-    fn new() -> Self {
+    fn new(rows: u16, cols: u16) -> Self {
         Self {
-            history: VecDeque::new(),
+            parser: TerminalParser::new(rows.max(1), cols.max(1), 0),
+            revision: 0,
             broadcasters: HashMap::new(),
         }
     }
 
     fn record_chunk(&mut self, chunk: &[u8]) -> Vec<(usize, Sender<Vec<u8>>)> {
-        self.history.extend(chunk.iter().copied());
-        while self.history.len() > MAX_HISTORY_BYTES {
-            self.history.pop_front();
+        if !chunk.is_empty() {
+            self.parser.process(chunk);
+            self.revision = self.revision.wrapping_add(1);
         }
         self.broadcasters
             .iter()
@@ -47,10 +50,27 @@ impl OutputState {
             .collect()
     }
 
+    fn resize(&mut self, rows: u16, cols: u16) {
+        self.parser.screen_mut().set_size(rows.max(1), cols.max(1));
+    }
+
     fn register_client(&mut self, id: usize, tx: Sender<Vec<u8>>) -> Vec<u8> {
-        let snapshot = self.history.iter().copied().collect::<Vec<_>>();
+        let snapshot = self.snapshot();
         self.broadcasters.insert(id, tx);
         snapshot
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        let mut snapshot = Vec::new();
+        if self.parser.screen().alternate_screen() {
+            snapshot.extend_from_slice(b"\x1b[?1049h");
+        }
+        snapshot.extend_from_slice(&self.parser.screen().state_formatted());
+        snapshot
+    }
+
+    fn revision(&self) -> usize {
+        self.revision
     }
 
     fn remove_client(&mut self, id: usize) {
@@ -74,13 +94,14 @@ pub fn run_server(store: &Store, hash: &str) -> Result<()> {
         );
     }
 
-    let pty_system = native_pty_system();
-    let pair = pty_system.openpty(PtySize {
+    let initial_size = PtySize {
         rows: 24,
         cols: 80,
         pixel_width: 0,
         pixel_height: 0,
-    })?;
+    };
+    let pty_system = native_pty_system();
+    let pair = pty_system.openpty(initial_size)?;
 
     let builder = sandbox::build_command(&session)?;
     let mut child = pair.slave.spawn_command(builder)?;
@@ -114,7 +135,10 @@ pub fn run_server(store: &Store, hash: &str) -> Result<()> {
         master.take_writer()?
     }));
     let running = Arc::new(AtomicBool::new(true));
-    let output_state: SharedOutputState = Arc::new(Mutex::new(OutputState::new()));
+    let output_state: SharedOutputState = Arc::new(Mutex::new(OutputState::new(
+        initial_size.rows,
+        initial_size.cols,
+    )));
     let next_client_id = Arc::new(AtomicUsize::new(1));
     let (fatal_tx, fatal_rx) = mpsc::channel::<String>();
 
@@ -276,8 +300,15 @@ fn handle_client(mut stream: UnixStream, state: ServerState) -> Result<()> {
         }
         b'R' => {
             let size = read_attach_size(&mut stream)?;
-            let master = state.master.lock().expect("pty master poisoned");
-            master.resize(size)?;
+            {
+                let master = state.master.lock().expect("pty master poisoned");
+                master.resize(size)?;
+            }
+            state
+                .output_state
+                .lock()
+                .expect("output state poisoned")
+                .resize(size.rows, size.cols);
             Ok(())
         }
         b'I' => {
@@ -322,12 +353,18 @@ fn handle_attach_client(mut stream: UnixStream, state: ServerState, size: PtySiz
     let client_id = state.next_client_id.fetch_add(1, Ordering::SeqCst);
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let mut write_stream = stream.try_clone()?;
-    let history = {
+    let baseline_revision = {
+        let mut output_state = state.output_state.lock().expect("output state poisoned");
+        output_state.resize(size.rows, size.cols);
+        output_state.revision()
+    };
+    wait_for_resize_redraw(&state.output_state, baseline_revision);
+    let snapshot = {
         let mut output_state = state.output_state.lock().expect("output state poisoned");
         output_state.register_client(client_id, tx)
     };
-    if !history.is_empty() {
-        write_stream.write_all(&history)?;
+    if !snapshot.is_empty() {
+        write_stream.write_all(&snapshot)?;
         write_stream.flush()?;
     }
 
@@ -379,6 +416,21 @@ fn handle_attach_client(mut stream: UnixStream, state: ServerState, size: PtySiz
     Ok(())
 }
 
+fn wait_for_resize_redraw(output_state: &SharedOutputState, baseline_revision: usize) {
+    let deadline = Instant::now() + ATTACH_REDRAW_WAIT;
+    while Instant::now() < deadline {
+        if output_state
+            .lock()
+            .expect("output state poisoned")
+            .revision()
+            != baseline_revision
+        {
+            return;
+        }
+        thread::sleep(ATTACH_REDRAW_POLL);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -390,6 +442,7 @@ mod tests {
     use std::time::Instant;
 
     use tempfile::tempdir;
+    use vt100::Parser;
 
     use super::*;
     use crate::model::{CommandMode, SandboxSpec, SessionStatus};
@@ -426,19 +479,33 @@ mod tests {
     }
 
     #[test]
-    fn output_state_trims_history_and_registers_snapshot() {
-        let mut state = OutputState::new();
-        let oversized = vec![b'x'; MAX_HISTORY_BYTES + 10];
-        let _ = state.record_chunk(&oversized);
+    fn output_state_renders_snapshot_and_omits_terminal_queries() {
+        let mut state = OutputState::new(12, 40);
+        let _ = state.record_chunk(b"\x1b[6nREADY");
         let (tx, _rx) = mpsc::channel();
         let snapshot = state.register_client(1, tx);
-        assert_eq!(snapshot.len(), MAX_HISTORY_BYTES);
-        assert!(snapshot.iter().all(|byte| *byte == b'x'));
+        assert!(
+            !snapshot.windows(4).any(|window| window == b"\x1b[6n"),
+            "snapshot unexpectedly replayed terminal query: {snapshot:?}"
+        );
+
+        let mut parser = Parser::new(12, 40, 0);
+        parser.process(&snapshot);
+        assert!(parser.screen().contents().contains("READY"));
+    }
+
+    #[test]
+    fn output_state_snapshot_preserves_alternate_screen_mode() {
+        let mut state = OutputState::new(6, 20);
+        let _ = state.record_chunk(b"\x1b[?1049hALT");
+
+        let snapshot = state.snapshot();
+        assert!(snapshot.starts_with(b"\x1b[?1049h"));
     }
 
     #[test]
     fn broadcast_removes_dead_clients() {
-        let output_state = Arc::new(Mutex::new(OutputState::new()));
+        let output_state = Arc::new(Mutex::new(OutputState::new(24, 80)));
         let (tx, rx) = mpsc::channel();
         output_state.lock().unwrap().register_client(1, tx);
         drop(rx);
@@ -452,7 +519,7 @@ mod tests {
         let writer = Arc::new(Mutex::new(
             Box::new(SharedWriter(shared.clone())) as Box<dyn Write + Send>
         ));
-        let output_state = Arc::new(Mutex::new(OutputState::new()));
+        let output_state = Arc::new(Mutex::new(OutputState::new(24, 80)));
         let (mut client, server) = UnixStream::pair().unwrap();
         client.write_all(b"Ihello").unwrap();
         client.shutdown(std::net::Shutdown::Write).unwrap();
@@ -498,7 +565,7 @@ mod tests {
             ServerState {
                 master: test_master(),
                 writer,
-                output_state: Arc::new(Mutex::new(OutputState::new())),
+                output_state: Arc::new(Mutex::new(OutputState::new(24, 80))),
                 next_client_id: Arc::new(AtomicUsize::new(1)),
                 child_pid: None,
             },
@@ -526,7 +593,7 @@ mod tests {
             ServerState {
                 master: test_master(),
                 writer,
-                output_state: Arc::new(Mutex::new(OutputState::new())),
+                output_state: Arc::new(Mutex::new(OutputState::new(24, 80))),
                 next_client_id: Arc::new(AtomicUsize::new(1)),
                 child_pid: Some(pid),
             },
@@ -539,7 +606,7 @@ mod tests {
 
     #[test]
     fn handle_attach_client_writer_thread_handles_peer_closed() {
-        let output_state = Arc::new(Mutex::new(OutputState::new()));
+        let output_state = Arc::new(Mutex::new(OutputState::new(24, 80)));
         let writer = Arc::new(Mutex::new(
             Box::new(SharedWriter(Arc::new(Mutex::new(Vec::new())))) as Box<dyn Write + Send>,
         ));

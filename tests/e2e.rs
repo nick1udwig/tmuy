@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::OnceLock;
@@ -185,15 +185,17 @@ fn interactive_new_attaches_by_default_and_uses_custom_detach_key() -> Result<()
     let home = TempDir::new()?;
 
     let mut session = spawn_pty_process(home.path(), &["new", "demo", "--detach-key", "C-a d"])?;
-    let output = session.read_until_contains("tmuy demo", Duration::from_secs(5))?;
-    assert!(output.contains("detach C-a d"));
-    assert!(output.contains("\u{1b}[?1049h"));
+    std::thread::sleep(Duration::from_millis(500));
+    session.write_all(b"echo auto-attach-ok\r")?;
+    let output = session.read_until_contains("auto-attach-ok", Duration::from_secs(5))?;
+    assert!(output.contains("auto-attach-ok"));
+    assert!(!output.contains("\u{1b}[?1049h"));
 
     session.write_all(&[0x01, b'd'])?;
     let status = session.wait_for_exit(Duration::from_secs(5))?;
     assert!(status.success(), "new exit status was {status:?}");
     let transcript = session.read_for(Duration::from_millis(300))?;
-    assert!(transcript.contains("\u{1b}[?1049l"));
+    assert!(!transcript.contains("\u{1b}[?1049l"));
 
     let sent = run_tmuy(home.path(), &["send", "demo", "exit\n"])?;
     assert_success(&sent);
@@ -277,8 +279,10 @@ fn attach_uses_session_detach_key_by_default() -> Result<()> {
         .to_string();
 
     let mut attach = spawn_attach(home.path(), &["attach", &hash])?;
-    let output = attach.read_until_contains("detach C-a d", Duration::from_secs(5))?;
-    assert!(output.contains("tmuy custom"));
+    std::thread::sleep(Duration::from_millis(500));
+    attach.write_all(b"echo custom-default\r")?;
+    let output = attach.read_until_contains("custom-default", Duration::from_secs(5))?;
+    assert!(output.contains("custom-default"));
 
     attach.write_all(&[0x01, b'd'])?;
     let status = attach.wait_for_exit(Duration::from_secs(5))?;
@@ -320,7 +324,7 @@ fn attach_rejects_recursive_attach_and_new_auto_attach() -> Result<()> {
     assert_success(&run_tmuy(home.path(), &["new", "other"])?);
 
     let mut attach = spawn_attach(home.path(), &["attach", "outer"])?;
-    let _ = attach.read_until_contains("tmuy outer", Duration::from_secs(5))?;
+    std::thread::sleep(Duration::from_millis(500));
 
     let recursive_attach = format!("{0} attach other; printf 'rc:%s\\n' $? \r", tmuy_bin());
     attach.write_all(recursive_attach.as_bytes())?;
@@ -388,6 +392,47 @@ fn attach_replays_existing_output() -> Result<()> {
 }
 
 #[test]
+fn attach_snapshot_omits_terminal_queries_from_existing_output() -> Result<()> {
+    let home = TempDir::new()?;
+    let created = run_tmuy(
+        home.path(),
+        &[
+            "new",
+            "snapshot",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "printf '\\033[6n\\033[cREADY'; sleep 30",
+        ],
+    )?;
+    assert_success(&created);
+
+    std::thread::sleep(Duration::from_millis(500));
+    let mut attach = spawn_attach(home.path(), &["attach", "snapshot"])?;
+    let output = attach.read_until_contains("READY", Duration::from_secs(5))?;
+    assert!(output.contains("READY"));
+    assert!(
+        !output.contains("\u{1b}[6n"),
+        "attach snapshot unexpectedly replayed DSR query:\n{output:?}"
+    );
+    assert!(
+        !output.contains("\u{1b}[c"),
+        "attach snapshot unexpectedly replayed device attributes query:\n{output:?}"
+    );
+
+    attach.write_all(&[0x02, b'd'])?;
+    let status = attach.wait_for_exit(Duration::from_secs(5))?;
+    assert!(status.success(), "attach exit status was {status:?}");
+
+    assert_success(&run_tmuy(home.path(), &["kill", "snapshot"])?);
+    assert_success(&run_tmuy(
+        home.path(),
+        &["wait", "snapshot", "--timeout-secs", "5"],
+    )?);
+    Ok(())
+}
+
+#[test]
 fn attach_accepts_unique_name_prefixes_and_rejects_ambiguous_ones() -> Result<()> {
     let home = TempDir::new()?;
     assert_success(&run_tmuy(home.path(), &["new", "foobar"])?);
@@ -407,8 +452,10 @@ fn attach_accepts_unique_name_prefixes_and_rejects_ambiguous_ones() -> Result<()
     );
 
     let mut attach = spawn_attach(home.path(), &["attach", "fo"])?;
-    let output = attach.read_until_contains("tmuy foobar", Duration::from_secs(5))?;
-    assert!(output.contains("tmuy foobar"));
+    std::thread::sleep(Duration::from_millis(500));
+    attach.write_all(b"echo prefix-ok\r")?;
+    let output = attach.read_until_contains("prefix-ok", Duration::from_secs(5))?;
+    assert!(output.contains("prefix-ok"));
 
     attach.write_all(&[0x02, b'd'])?;
     let status = attach.wait_for_exit(Duration::from_secs(5))?;
@@ -428,28 +475,25 @@ fn attach_accepts_unique_name_prefixes_and_rejects_ambiguous_ones() -> Result<()
 }
 
 #[test]
-fn attach_shows_status_bar_immediately_for_quiet_sessions() -> Result<()> {
+fn attach_stays_on_primary_screen_for_quiet_sessions() -> Result<()> {
     let home = TempDir::new()?;
     let created = run_tmuy(
         home.path(),
-        &["--json", "new", "quiet", "--", "/bin/sh", "-lc", "sleep 30"],
+        &["new", "quiet", "--", "/bin/sh", "-lc", "sleep 30"],
     )?;
     assert_success(&created);
-    let created_json: serde_json::Value = serde_json::from_slice(&created.stdout)?;
-    let hash = created_json["id_hash"]
-        .as_str()
-        .context("missing id_hash in new --json output")?
-        .to_string();
 
     let mut attach = spawn_attach(home.path(), &["attach", "quiet"])?;
-    let output = attach.read_until_contains("tmuy quiet", Duration::from_secs(5))?;
-    assert!(output.contains(&hash));
-    assert!(output.contains("detach C-b d"));
-    assert!(output.contains("sandbox fs:full net:on"));
+    let output = attach.read_until_contains("\u{1b}[?2004h", Duration::from_secs(5))?;
+    assert!(!output.contains("\u{1b}[?1049h"));
+    assert!(!output.contains("\u{1b}7"));
+    assert!(!output.contains("tmuy quiet"));
 
     attach.write_all(&[0x02, b'd'])?;
     let status = attach.wait_for_exit(Duration::from_secs(5))?;
     assert!(status.success(), "attach exit status was {status:?}");
+    let transcript = attach.read_for(Duration::from_millis(300))?;
+    assert!(!transcript.contains("\u{1b}[?1049l"));
 
     let interrupted = run_tmuy(home.path(), &["kill", "quiet"])?;
     assert_success(&interrupted);
@@ -468,7 +512,7 @@ fn attach_enables_bracketed_paste_for_quiet_sessions() -> Result<()> {
     assert_success(&created);
 
     let mut attach = spawn_attach(home.path(), &["attach", "quiet-paste"])?;
-    let initial = attach.read_until_contains("tmuy quiet-paste", Duration::from_secs(5))?;
+    let initial = attach.read_until_contains("\u{1b}[?2004h", Duration::from_secs(5))?;
     assert!(
         initial.contains("\u{1b}[?2004h"),
         "attach transcript did not enable bracketed paste:\n{initial:?}"
@@ -488,6 +532,36 @@ fn attach_enables_bracketed_paste_for_quiet_sessions() -> Result<()> {
         home.path(),
         &["wait", "quiet-paste", "--timeout-secs", "5"],
     )?);
+    Ok(())
+}
+
+#[test]
+fn attach_does_not_inject_ui_bytes_between_terminal_escape_chunks() -> Result<()> {
+    let home = TempDir::new()?;
+    let created = run_tmuy(
+        home.path(),
+        &[
+            "new",
+            "ansi-split",
+            "--",
+            "/bin/sh",
+            "-lc",
+            "sleep 0.2; printf '\\033[31;'; sleep 0.3; printf '1mHELLO\\033[0m\\r\\n'; sleep 0.3",
+        ],
+    )?;
+    assert_success(&created);
+
+    let mut attach = spawn_attach(home.path(), &["attach", "ansi-split"])?;
+    let output = attach.read_until_contains("HELLO", Duration::from_secs(5))?;
+    assert!(
+        output.contains("\u{1b}[31;1mHELLO"),
+        "split escape sequence was corrupted during attach:\n{output:?}"
+    );
+    assert!(!output.contains("\u{1b}[?1049h"));
+    assert!(!output.contains("tmuy ansi-split"));
+
+    let status = attach.wait_for_exit(Duration::from_secs(5))?;
+    assert!(status.success(), "attach exit status was {status:?}");
     Ok(())
 }
 
@@ -517,7 +591,7 @@ fn attach_preserves_reverse_search_screen_for_long_history_entries() -> Result<(
     std::thread::sleep(Duration::from_millis(300));
 
     let mut attach = spawn_pty_process_with_size(home.path(), &["attach", "searchy"], 8, 40)?;
-    let mut transcript = attach.read_until_contains("tmuy searchy", Duration::from_secs(5))?;
+    let mut transcript = attach.read_until_contains("$ ", Duration::from_secs(5))?;
     attach.write_all(b"\x12TOKEN_")?;
     transcript.push_str(&attach.read_for(Duration::from_millis(800))?);
 
@@ -530,14 +604,66 @@ fn attach_preserves_reverse_search_screen_for_long_history_entries() -> Result<(
         screen.contains("echo TOKEN_"),
         "matched command missing from screen:\n{screen}\n\nraw:\n{transcript:?}"
     );
+    let active_line = screen
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default();
     assert!(
-        !screen.contains("$ echo TOKEN_"),
+        !active_line.contains("$ echo TOKEN_"),
         "shell prompt leaked into active reverse-search line:\n{screen}\n\nraw:\n{transcript:?}"
     );
 
     attach.write_all(&[0x02, b'd'])?;
     let status = attach.wait_for_exit(Duration::from_secs(5))?;
     assert!(status.success(), "attach exit status was {status:?}");
+    Ok(())
+}
+
+#[test]
+fn attach_propagates_terminal_resize_to_live_sessions() -> Result<()> {
+    let home = TempDir::new()?;
+    let created = run_tmuy(
+        home.path(),
+        &[
+            "new",
+            "resizer",
+            "--",
+            "/usr/bin/env",
+            "PS1=$ ",
+            "TERM=xterm-256color",
+            "/bin/bash",
+            "--norc",
+            "--noprofile",
+            "-i",
+        ],
+    )?;
+    assert_success(&created);
+
+    let mut attach = spawn_pty_process_with_size(home.path(), &["attach", "resizer"], 10, 40)?;
+    let _ = attach.read_until_contains("$ ", Duration::from_secs(5))?;
+    attach.write_all(b"stty size\r")?;
+    let first = attach.read_until_contains("10 40", Duration::from_secs(5))?;
+    assert!(first.contains("10 40"));
+
+    resize_pty(&attach.master, 18, 70)?;
+    std::thread::sleep(Duration::from_millis(400));
+    attach.write_all(b"stty size\r")?;
+    let second = attach.read_until_contains("18 70", Duration::from_secs(5))?;
+    assert!(
+        second.contains("18 70"),
+        "resize did not propagate:\n{second:?}"
+    );
+
+    attach.write_all(&[0x02, b'd'])?;
+    let status = attach.wait_for_exit(Duration::from_secs(5))?;
+    assert!(status.success(), "attach exit status was {status:?}");
+
+    assert_success(&run_tmuy(home.path(), &["send", "resizer", "exit\n"])?);
+    assert_success(&run_tmuy(
+        home.path(),
+        &["wait", "resizer", "--timeout-secs", "5"],
+    )?);
     Ok(())
 }
 
@@ -1011,6 +1137,21 @@ fn spawn_output_tmuy(home: &Path, args: &[&str]) -> Result<OutputHarness> {
         .take()
         .ok_or_else(|| anyhow::anyhow!("child stdout was not piped"))?;
     Ok(OutputHarness { child, stdout })
+}
+
+fn resize_pty(master: &File, rows: u16, cols: u16) -> Result<()> {
+    let winsize = Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: ioctl is called with a valid PTY file descriptor and pointer to a Winsize value.
+    let result = unsafe { nix::libc::ioctl(master.as_raw_fd(), nix::libc::TIOCSWINSZ, &winsize) };
+    if result == -1 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
 }
 
 fn read_ready(master: &mut File, timeout: Duration) -> Result<Vec<u8>> {
